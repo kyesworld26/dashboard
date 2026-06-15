@@ -66,11 +66,60 @@ function readPairingToken() {
   try { return fs.readFileSync(TOKEN_FILE, 'utf-8').trim() || null; } catch { return null; }
 }
 
+// Sent in every hello message (pair + auth) so the hub / dashboard has a fresh
+// inventory of this host the moment it (re)connects — never stale because the
+// dashboard refetches whenever the agent comes back online. Best-effort: any
+// individual probe that throws is reported as null rather than failing hello.
 function agentInfo() {
+  const os = require('os');
+  const { execSync } = require('child_process');
+  const safe = (fn, dflt = null) => { try { return fn(); } catch { return dflt; } };
+  const exec = (cmd, timeout = 2000) => safe(() => execSync(cmd, { timeout, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(), null);
+
+  const dockerVersion  = exec('docker --version');
+  const dockerInfo     = exec('docker info --format "{{.ServerVersion}}"');
+  const composeVersion = exec('docker compose version --short') || exec('docker-compose --version');
+  const composeFile    = process.env.MAIN_COMPOSE
+    || (() => {
+      for (const root of ['/root', '/srv', ...safe(() => fs.readdirSync('/home').map(d => path.join('/home', d)), []),
+                          ...safe(() => fs.readdirSync('/opt').map(d => path.join('/opt', d)), [])]) {
+        for (const f of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+          const p = path.join(root, f);
+          if (safe(() => fs.statSync(p).isFile(), false)) return p;
+        }
+      }
+      return null;
+    })();
+
+  const totalMem = os.totalmem();
+  const cpus = os.cpus() || [];
+  const ifaces = Object.values(os.networkInterfaces() || {}).flat()
+    .filter(i => i && !i.internal && i.family === 'IPv4').map(i => i.address);
+
   return {
-    hostname: require('os').hostname(),
+    version: 2,
+    hostname: os.hostname(),
     platform: process.platform,
-    version: 1,
+    arch: process.arch,
+    release: os.release(),
+    uptimeSec: Math.round(os.uptime()),
+    cpuModel: cpus[0]?.model || null,
+    cpuCount: cpus.length,
+    totalMemBytes: totalMem,
+    freeMemBytes: os.freemem(),
+    loadAvg: os.loadavg(),
+    ipv4: ifaces,
+    docker: {
+      installed: !!dockerVersion,
+      running: !!dockerInfo,
+      version: dockerVersion,
+      serverVersion: dockerInfo,
+      composeVersion,
+    },
+    serverRoot: composeFile ? path.dirname(composeFile) : null,
+    composeFile,
+    composeExists: !!composeFile,
+    agentVersion: safe(() => require('./package.json').version, '0.0.0'),
   };
 }
 

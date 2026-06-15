@@ -583,6 +583,34 @@ async function listDockerContainers() {
   }
 }
 
+// Probe whether the docker daemon is actually reachable on this host. Cheaper
+// than listDockerContainers when the daemon is down (fails fast on the socket
+// connect). Cached for 5s so repeated /api/services calls don't hammer it.
+let _dockerStatusCache = { value: null, ts: 0 };
+async function getDockerStatus() {
+  const now = Date.now();
+  if (_dockerStatusCache.value && now - _dockerStatusCache.ts < 5000) return _dockerStatusCache.value;
+  let installed = false, running = false, error = null;
+  try {
+    await execCmd('docker --version', 2000);
+    installed = true;
+  } catch { /* docker binary not on PATH */ }
+  if (installed) {
+    try {
+      await execCmd('docker info --format "{{.ServerVersion}}"', 3000);
+      running = true;
+    } catch (err) {
+      error = (err.stderr || err.error || '').toString().trim().split('\n').slice(-1)[0]
+        || 'docker daemon not reachable';
+    }
+  } else {
+    error = "docker is not installed on this host (the agent's start/stop/logs actions need it)";
+  }
+  const value = { installed, running, error };
+  _dockerStatusCache = { value, ts: now };
+  return value;
+}
+
 function labelsObject(labels) {
   return String(labels || '').split(',').reduce((acc, item) => {
     const eq = item.indexOf('=');
@@ -1091,7 +1119,8 @@ function requireAuth(req, res, next) {
 app.get('/api/services', async (req, res) => {
   try {
     const mainServices   = await getMainComposeServices();
-    const containers     = await listDockerContainers();
+    const docker         = await getDockerStatus();
+    const containers     = docker.running ? await listDockerContainers() : [];
     const caddyContent   = await readTextIfExists(CADDYFILE, '');
     const caddyContainer = findContainerForService(containers, 'caddy');
 
@@ -1115,13 +1144,21 @@ app.get('/api/services', async (req, res) => {
       const container = matched[0] || null;
       const caddyStatic = inCompose ? getCaddyStaticService(name, mainServices, caddyContent) : null;
 
-      let status = aggregateContainerStatus(matched);
-      let uptime = container?.Status || null;
-      let statusSource = matched.length ? 'container' : 'none';
-      if (status === 'not deployed' && caddyStatic) {
-        status = getContainerStatus(caddyContainer);
-        uptime = caddyContainer?.Status || null;
-        statusSource = 'caddy';
+      // When docker is unreachable we genuinely don't know whether services
+      // are running — report 'unknown' so the UI can render a "Docker not
+      // running" pill instead of falsely showing everything as "stopped".
+      let status, uptime = container?.Status || null, statusSource;
+      if (!docker.running) {
+        status = 'unknown';
+        statusSource = 'docker-unavailable';
+      } else {
+        status = aggregateContainerStatus(matched);
+        statusSource = matched.length ? 'container' : 'none';
+        if (status === 'not deployed' && caddyStatic) {
+          status = getContainerStatus(caddyContainer);
+          uptime = caddyContainer?.Status || null;
+          statusSource = 'caddy';
+        }
       }
 
       return {
@@ -1140,6 +1177,8 @@ app.get('/api/services', async (req, res) => {
         image:         container?.Image || null,
         ports:         container?.Ports || null,
         uptime,
+        dockerAvailable: docker.running,
+        dockerError:     docker.running ? null : docker.error,
       };
     });
 
@@ -1147,6 +1186,12 @@ app.get('/api/services', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// GET /api/docker/status — dedicated endpoint so the dashboard can show a
+// top-level "Docker not running" banner without parsing the services list.
+app.get('/api/docker/status', async (req, res) => {
+  res.json(await getDockerStatus());
 });
 
 // GET /api/services/:name/stats
@@ -1168,6 +1213,12 @@ app.get('/api/services/:name/logs', async (req, res) => {
   const tail = parseInt(req.query.tail) || 200;
   try {
     if (!isSafeName(name)) throw new Error('Invalid service name.');
+    const docker = await getDockerStatus();
+    if (!docker.running) {
+      throw new Error(docker.installed
+        ? "Docker daemon isn't running on this host — no logs to fetch yet."
+        : "Docker isn't installed on this host.");
+    }
     const target = await getContainerTarget(name);
     const safeTail = Math.min(Math.max(tail, 1), 5000);
     const { stdout, stderr } = await execCmd(`docker logs --tail ${safeTail} --timestamps ${shQuote(target)} 2>&1`, 15000);
@@ -1549,6 +1600,18 @@ async function serviceAction(req, res, action, timeout = 120000) {
   const { name } = req.params;
   try {
     if (!isSafeName(name)) throw new Error('Invalid service name.');
+
+    // Fail fast with a useful message instead of leaking a raw socket error
+    // when the host has no docker yet or the daemon is stopped.
+    const docker = await getDockerStatus();
+    if (!docker.running) {
+      throw new Error(
+        docker.installed
+          ? "Docker is installed but the daemon isn't running. Start it with: sudo systemctl start docker"
+          : "Docker is not installed on this server. Install it (e.g. https://get.docker.com) then 'sudo systemctl restart dashboard-agent'."
+      );
+    }
+
     const related = await getRelatedServiceNames(name);
     let cmd;
     if (related.length > 1) {

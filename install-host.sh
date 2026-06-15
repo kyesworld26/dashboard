@@ -108,18 +108,38 @@ echo "==> Preparing data directory at $DATA_DIR..."
 mkdir -p "$DATA_DIR"
 chmod 700 "$DATA_DIR"
 
-# Best-effort: make sure docker / docker-compose are present so the agent can
-# manage the host's container stack. Don't fail the installer if they aren't.
+# Install Docker if missing — the agent's whole point is managing docker
+# services. Opt out with SKIP_DOCKER_INSTALL=1 (e.g. for hosts where docker
+# is provided by a different stack like Rancher/k3s).
 if ! command -v docker >/dev/null 2>&1; then
-  echo "    note: 'docker' isn't on PATH — install it if you want the agent to manage docker services."
+  if [[ "${SKIP_DOCKER_INSTALL:-0}" == "1" ]]; then
+    echo "    SKIP_DOCKER_INSTALL=1 set — leaving docker uninstalled."
+    echo "    The dashboard will show services as 'unknown' until you install docker."
+  else
+    echo "==> Installing Docker (engine + compose plugin) via get.docker.com..."
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker || true
+    echo "    Docker: $(docker --version 2>/dev/null || echo 'install failed — install manually and re-run this script')"
+  fi
+else
+  echo "    Docker already installed: $(docker --version)"
+fi
+
+# Make sure the docker daemon is actually running, not just installed.
+if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
+  echo "    Docker is installed but not running — attempting 'systemctl start docker'..."
+  systemctl start docker || echo "    (could not start docker automatically — start it manually)"
 fi
 
 echo "==> Writing systemd unit /etc/systemd/system/dashboard-agent.service..."
 cat >/etc/systemd/system/dashboard-agent.service <<EOF
 [Unit]
 Description=Dashboard agent (outbound tunnel to hub + local management API)
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
+# Soft dep on docker — the agent still runs (and shows 'unknown' service
+# states) if docker is missing, but if docker is present we want it up first.
+Wants=docker.service
 
 [Service]
 Type=simple
