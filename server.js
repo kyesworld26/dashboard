@@ -586,26 +586,65 @@ async function listDockerContainers() {
 function labelsObject(labels) {
   return String(labels || '').split(',').reduce((acc, item) => {
     const eq = item.indexOf('=');
-    if (eq > -1) acc[item.slice(0, eq)] = item.slice(eq + 1);
+    if (eq > -1) acc[item.slice(0, eq).trim()] = item.slice(eq + 1);
     return acc;
   }, {});
 }
 
+function containerNames(c) {
+  return String(c?.Names || '').split(',').map(n => n.trim()).filter(Boolean);
+}
+
+// Match a docker container to a compose service by, in order of certainty:
+//   1. The compose label `com.docker.compose.service=<name>` — set by both
+//      docker compose v1 (project_service_idx) and v2 (project-service-idx).
+//      Reliable across naming changes; the right thing 99% of the time.
+//   2. Exact container_name match (when the compose has `container_name: foo`
+//      docker uses that verbatim and no compose label is added on legacy v1).
+//   3. Compose-default naming: <project>(-|_)<service>(-|_)<index> — used when
+//      labels are stripped somehow (custom labels, externally-recreated, etc).
+// We do NOT do a loose substring match anymore: it produced false positives
+// like service "db" matching container "couchdb" or "web" matching "webhook",
+// which is why the dashboard sometimes showed a service as running/stopped
+// based on a completely unrelated container's state.
 function findContainerForService(containers, name) {
+  if (!name) return null;
   const lower = name.toLowerCase();
-  return containers.find(c => labelsObject(c.Labels)['com.docker.compose.service'] === name)
-    || containers.find(c => (c.Names || '').split(',').some(n => n.toLowerCase() === lower))
-    || containers.find(c => (c.Names || '').toLowerCase().includes(lower));
+  const composePattern = new RegExp(`(^|[-_])${escapeRegExp(lower)}([-_]\\d+)?$`);
+
+  const matches = containers.filter(c => {
+    if (labelsObject(c.Labels)['com.docker.compose.service'] === name) return true;
+    const names = containerNames(c);
+    if (names.some(n => n.toLowerCase() === lower)) return true;
+    if (names.some(n => composePattern.test(n.toLowerCase()))) return true;
+    return false;
+  });
+
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0];
+  // Multiple candidates (e.g. a stale stopped container + a new running one
+  // from compose up -> down -> up): prefer the running one, then any
+  // non-exited one, then the most-recently-created.
+  return matches.find(c => (c.State || '').toLowerCase() === 'running')
+      || matches.find(c => !/exited|dead/.test((c.State || '').toLowerCase()))
+      || matches.slice().sort((a, b) => (b.CreatedAt || '').localeCompare(a.CreatedAt || ''))[0];
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function getContainerStatus(container) {
   if (!container) return 'not deployed';
   const s = (container.State || container.Status || '').toLowerCase();
-  return s.includes('running') ? 'running'
-    : s.includes('exited') || s.includes('stopped') ? 'stopped'
-    : s.includes('restart') ? 'restarting'
-    : s.includes('paused') ? 'paused'
-    : s || 'unknown';
+  if (s.includes('running'))    return 'running';
+  if (s.includes('restart'))    return 'restarting';
+  if (s.includes('paused'))     return 'paused';
+  if (s.includes('exited') ||
+      s.includes('stopped') ||
+      s.includes('dead'))        return 'stopped';
+  if (s.includes('created'))    return 'created';
+  return s || 'unknown';
 }
 
 function aggregateContainerStatus(containers) {
@@ -955,7 +994,10 @@ async function auditServiceDirectory(serviceDir, finalServices, serverRoot) {
 async function getContainerTarget(name) {
   const containers = await listDockerContainers();
   const container = findContainerForService(containers, name);
-  return container?.ID || container?.Names || name;
+  // Prefer the container ID (always unambiguous). If we only have Names, pick
+  // the first one — Names can be a comma-separated list and passing the raw
+  // value to `docker stats|logs` would error out.
+  return container?.ID || containerNames(container)[0] || name;
 }
 
 // Env file: try compose env_file, .name-env, name.env, .name (matching the server's convention)
