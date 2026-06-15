@@ -28,12 +28,22 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # Refuse to "update" something that was never installed — point them at the
-# installer so they don't end up with half-configured state.
-if ! systemctl list-unit-files | grep -q "^${SERVICE}\.service"; then
-  echo "error: ${SERVICE}.service is not installed."
+# installer so they don't end up with half-configured state. We check for
+# concrete artifacts of a previous install rather than parsing systemctl
+# output (which varies between distros / systemd versions).
+UNIT_FILE=/etc/systemd/system/${SERVICE}.service
+if [[ ! -f "$UNIT_FILE" && ! -d "$INSTALL_DIR" ]]; then
+  echo "error: ${SERVICE} is not installed (no $UNIT_FILE, no $INSTALL_DIR)."
   echo "       Run the installer first:"
   echo "         curl -fsSL https://raw.githubusercontent.com/kyesworld26/dashboard/main/install-host.sh | sudo bash"
   exit 1
+fi
+if [[ ! -f "$UNIT_FILE" ]]; then
+  echo "warning: $INSTALL_DIR exists but $UNIT_FILE is missing — will reinstall the unit."
+fi
+if [[ ! -d "$INSTALL_DIR" ]]; then
+  echo "warning: $UNIT_FILE exists but $INSTALL_DIR is missing — will recreate the install dir."
+  mkdir -p "$INSTALL_DIR"
 fi
 
 echo "==> Capturing currently-installed version..."
