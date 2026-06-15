@@ -583,25 +583,28 @@ async function listDockerContainers() {
   }
 }
 
-// Probe whether the docker daemon is actually reachable on this host. Cheaper
-// than listDockerContainers when the daemon is down (fails fast on the socket
-// connect). Cached for 5s so repeated /api/services calls don't hammer it.
+// Probe whether the docker daemon is actually reachable on this host. We use
+// `docker ps -q` (cheapest possible call — just enumerate IDs) as the
+// liveness check; it succeeds in single-digit ms when the daemon is up and
+// fails fast with a useful socket error when it isn't. Cached for 5s so
+// repeated /api/services calls don't hammer it.
 let _dockerStatusCache = { value: null, ts: 0 };
 async function getDockerStatus() {
   const now = Date.now();
   if (_dockerStatusCache.value && now - _dockerStatusCache.ts < 5000) return _dockerStatusCache.value;
   let installed = false, running = false, error = null;
   try {
-    await execCmd('docker --version', 2000);
+    await execCmd('docker --version', 5000);
     installed = true;
   } catch { /* docker binary not on PATH */ }
   if (installed) {
     try {
-      await execCmd('docker info --format "{{.ServerVersion}}"', 3000);
+      await execCmd('docker ps -q', 8000);
       running = true;
     } catch (err) {
-      error = (err.stderr || err.error || '').toString().trim().split('\n').slice(-1)[0]
-        || 'docker daemon not reachable';
+      const raw = (err.stderr || err.error || '').toString().trim();
+      error = raw.split('\n').slice(-1)[0] || 'docker daemon not reachable';
+      console.warn('[agent] docker daemon probe failed:', error);
     }
   } else {
     error = "docker is not installed on this host (the agent's start/stop/logs actions need it)";
@@ -1119,8 +1122,15 @@ function requireAuth(req, res, next) {
 app.get('/api/services', async (req, res) => {
   try {
     const mainServices   = await getMainComposeServices();
-    const docker         = await getDockerStatus();
-    const containers     = docker.running ? await listDockerContainers() : [];
+    // Always try to list containers regardless of what the probe says. If the
+    // probe misfires (slow daemon, weird timeout) but `docker ps` actually
+    // works, we still get correct per-service states. Only when BOTH probe
+    // and listing yield nothing do we fall back to the "unknown" UX.
+    const [docker, containers] = await Promise.all([
+      getDockerStatus(),
+      listDockerContainers(),
+    ]);
+    const dockerActuallyReachable = docker.running || containers.length > 0;
     const caddyContent   = await readTextIfExists(CADDYFILE, '');
     const caddyContainer = findContainerForService(containers, 'caddy');
 
@@ -1144,21 +1154,25 @@ app.get('/api/services', async (req, res) => {
       const container = matched[0] || null;
       const caddyStatic = inCompose ? getCaddyStaticService(name, mainServices, caddyContent) : null;
 
-      // When docker is unreachable we genuinely don't know whether services
-      // are running — report 'unknown' so the UI can render a "Docker not
-      // running" pill instead of falsely showing everything as "stopped".
+      // Prefer the container-list result whenever we have one — that's the
+      // ground truth. Only fall back to "unknown" when we have BOTH no
+      // matching container AND no evidence that docker is reachable at all
+      // (so the user gets a clear "docker isn't running" rather than a
+      // misleading "not deployed").
       let status, uptime = container?.Status || null, statusSource;
-      if (!docker.running) {
+      if (matched.length) {
+        status = aggregateContainerStatus(matched);
+        statusSource = 'container';
+      } else if (caddyStatic && caddyContainer) {
+        status = getContainerStatus(caddyContainer);
+        uptime = caddyContainer?.Status || null;
+        statusSource = 'caddy';
+      } else if (!dockerActuallyReachable) {
         status = 'unknown';
         statusSource = 'docker-unavailable';
       } else {
-        status = aggregateContainerStatus(matched);
-        statusSource = matched.length ? 'container' : 'none';
-        if (status === 'not deployed' && caddyStatic) {
-          status = getContainerStatus(caddyContainer);
-          uptime = caddyContainer?.Status || null;
-          statusSource = 'caddy';
-        }
+        status = 'not deployed';
+        statusSource = 'none';
       }
 
       return {
@@ -1177,8 +1191,8 @@ app.get('/api/services', async (req, res) => {
         image:         container?.Image || null,
         ports:         container?.Ports || null,
         uptime,
-        dockerAvailable: docker.running,
-        dockerError:     docker.running ? null : docker.error,
+        dockerAvailable: dockerActuallyReachable,
+        dockerError:     dockerActuallyReachable ? null : docker.error,
       };
     });
 
@@ -1192,6 +1206,55 @@ app.get('/api/services', async (req, res) => {
 // top-level "Docker not running" banner without parsing the services list.
 app.get('/api/docker/status', async (req, res) => {
   res.json(await getDockerStatus());
+});
+
+// GET /api/services/diagnose — debugging endpoint. Returns the raw container
+// list AND, for every compose service, exactly which container matched it
+// (or didn't) and why. Use when the dashboard shows wrong states:
+//   curl -s http://127.0.0.1:37001/api/services/diagnose | jq .
+app.get('/api/services/diagnose', async (req, res) => {
+  try {
+    const mainServices = await getMainComposeServices();
+    const [docker, containers] = await Promise.all([
+      getDockerStatus(),
+      listDockerContainers(),
+    ]);
+    const services = Object.keys(mainServices).map(name => {
+      const def     = mainServices[name];
+      const targets = [...new Set([name, def?.container_name].filter(Boolean))];
+      const matched = targets.map(t => ({ target: t, container: findContainerForService(containers, t) }));
+      return {
+        service: name,
+        containerName: def?.container_name || null,
+        triedTargets:  targets,
+        matches:       matched.map(m => ({
+          target:         m.target,
+          matchedName:    m.container ? containerNames(m.container) : null,
+          matchedId:      m.container?.ID || null,
+          matchedState:   m.container?.State || null,
+          composeService: m.container ? labelsObject(m.container.Labels)['com.docker.compose.service'] : null,
+          composeProject: m.container ? labelsObject(m.container.Labels)['com.docker.compose.project'] : null,
+        })),
+      };
+    });
+    res.json({
+      serverRoot: SERVER_ROOT,
+      composeFile: MAIN_COMPOSE,
+      docker,
+      containerCount: containers.length,
+      containers: containers.map(c => ({
+        names:   containerNames(c),
+        state:   c.State,
+        status:  c.Status,
+        image:   c.Image,
+        service: labelsObject(c.Labels)['com.docker.compose.service'] || null,
+        project: labelsObject(c.Labels)['com.docker.compose.project'] || null,
+      })),
+      services,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
 });
 
 // GET /api/services/:name/stats
