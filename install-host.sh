@@ -30,6 +30,10 @@ DATA_DIR=/var/lib/dashboard-agent
 SERVICE_USER=root                                    # root so the terminal is a real host shell
 HUB_URL=${HUB_URL:-wss://dashboard.kyesworld.com/agent}
 SERVER_ROOT=${SERVER_ROOT:-/home/server}
+# Apex domain used when the agent auto-generates Caddy reverse-proxy blocks
+# (e.g. PUBLIC_BASE_DOMAIN=example.com → 'myservice.example.com:80 { ... }').
+# Empty = use the bare service name as the site address (safe default).
+PUBLIC_BASE_DOMAIN=${PUBLIC_BASE_DOMAIN:-}
 
 if [[ $EUID -ne 0 ]]; then
   echo "error: this installer must run as root (sudo)." >&2
@@ -39,7 +43,7 @@ fi
 # Locate the source tree containing tunnel.js etc. When invoked via
 # `curl | sudo bash`, this script is piped from stdin (BASH_SOURCE is empty or
 # /dev/stdin), so we fall back to cloning the repo into a temp dir.
-SRC_FILES=(tunnel.js server.js link.js token.js package.json)
+SRC_FILES=(tunnel.js server.js link.js package.json)
 SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   candidate=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -83,7 +87,7 @@ echo "    Node: $(node --version)"
 
 echo "==> Installing agent files to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
-for f in tunnel.js server.js link.js token.js package.json; do
+for f in tunnel.js server.js link.js package.json; do
   cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/$f"
 done
 [[ -f "$SCRIPT_DIR/package-lock.json" ]] && cp "$SCRIPT_DIR/package-lock.json" "$INSTALL_DIR/" || true
@@ -116,6 +120,7 @@ WorkingDirectory=$INSTALL_DIR
 Environment=HUB_URL=$HUB_URL
 Environment=AGENT_DATA_DIR=$DATA_DIR
 Environment=SERVER_ROOT=$SERVER_ROOT
+Environment=PUBLIC_BASE_DOMAIN=$PUBLIC_BASE_DOMAIN
 ExecStart=$(command -v node) $INSTALL_DIR/tunnel.js
 Restart=always
 RestartSec=5

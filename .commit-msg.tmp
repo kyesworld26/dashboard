@@ -1,0 +1,13 @@
+Security/cleanup pass
+
+- Remove unused Dockerfile, .dockerignore, token.js (installer is
+  native-only; token.js was superseded by `dashboard-link` and its docstring
+  referenced the obsolete `docker compose exec` invocation).
+- Parameterize Caddy auto-gen apex via PUBLIC_BASE_DOMAIN env var (was
+  hardcoded to a personal domain). Empty default means generated configs
+  contain only the service name and leak nothing.
+- install-host.sh threads PUBLIC_BASE_DOMAIN through to the systemd unit and
+  documents it in the override table.
+- Fix stale "docker compose exec agent npm run link" doc comments in
+  link.js / tunnel.js to point at the native `dashboard-link` wrapper.
+- Drop "token" entry from package.json scripts.

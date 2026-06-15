@@ -29,12 +29,21 @@ What that does:
 5. Writes and starts `/etc/systemd/system/dashboard-agent.service`.
 6. Adds `dashboard-link` to your `PATH`.
 
-Override the hub URL or paths if needed:
+Override the hub URL, paths, or auto-generated Caddy apex domain if needed:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kyesworld26/dashboard/main/install-host.sh \
-  | sudo HUB_URL=wss://my.hub/agent SERVER_ROOT=/opt/myapp bash
+  | sudo HUB_URL=wss://my.hub/agent \
+         SERVER_ROOT=/opt/myapp \
+         PUBLIC_BASE_DOMAIN=example.com \
+         bash
 ```
+
+| Env | Default | Effect |
+| --- | --- | --- |
+| `HUB_URL` | `wss://dashboard.kyesworld.com/agent` | Where the agent dials out to |
+| `SERVER_ROOT` | `/home/server` | Filesystem root the dashboard manages (compose files, uploads, etc.) |
+| `PUBLIC_BASE_DOMAIN` | *(empty)* | Apex used when the agent auto-generates Caddy reverse-proxy blocks (`<service>.<apex>:80`). Empty = use the bare service name. |
 
 ## Link to a dashboard account
 
@@ -68,7 +77,7 @@ sudo systemctl restart dashboard-agent     # restart after editing the unit
 
 | Path | Purpose |
 | --- | --- |
-| `/opt/dashboard-agent/` | Agent code (`tunnel.js`, `server.js`, `link.js`, ...) |
+| `/opt/dashboard-agent/` | Agent code (`tunnel.js`, `server.js`, `link.js`) |
 | `/var/lib/dashboard-agent/agent.json` | Array of `{serverId, agentSecret}` — one per linked account |
 | `/var/lib/dashboard-agent/pairing.txt` | One-time pairing token written by `link.js` (auto-deleted after pair) |
 | `/etc/systemd/system/dashboard-agent.service` | systemd unit |

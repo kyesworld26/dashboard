@@ -77,7 +77,7 @@ function agentInfo() {
 function printNotLinkedBanner() {
   console.log('\n' + '='.repeat(64));
   console.log('  This server is NOT linked to any dashboard account yet.');
-  console.log('  Run:  docker compose exec agent npm run link');
+  console.log('  Run:  sudo dashboard-link');
   console.log('  (log in with your dashboard account to generate a token)');
   console.log('='.repeat(64) + '\n');
 }

@@ -861,8 +861,14 @@ async function findStaticDirs(serviceDir, finalServices) {
   return result;
 }
 
-// Build a Caddy block from the final services map
+// Build a Caddy block from the final services map. The public hostname for
+// each generated site is `<service>.<PUBLIC_BASE_DOMAIN>` — set
+// PUBLIC_BASE_DOMAIN in the systemd unit (install-host.sh wires it up) to your
+// own apex. If unset the service name itself is used as the site address so
+// nothing personal leaks into auto-generated configs.
 function generateSmartCaddy(name, finalServices) {
+  const baseDomain = (process.env.PUBLIC_BASE_DOMAIN || '').trim();
+  const site = baseDomain ? `${name}.${baseDomain}:80` : `${name}:80`;
   const entries = Object.entries(finalServices);
   const buildSvcs  = entries.filter(([, s]) => s?.build !== undefined);
   const nginxSvcs  = entries.filter(([, s]) => s?.image === 'nginx:alpine');
@@ -870,17 +876,17 @@ function generateSmartCaddy(name, finalServices) {
   if (nginxSvcs.length > 0 && buildSvcs.length > 0) {
     const [nginxName]   = nginxSvcs[0];
     const [backendName] = buildSvcs[0];
-    return `${name}.kyesworld.com:80 {\n    handle /api/* {\n        reverse_proxy ${backendName}:3000\n    }\n    handle {\n        reverse_proxy ${nginxName}:80\n    }\n}`;
+    return `${site} {\n    handle /api/* {\n        reverse_proxy ${backendName}:3000\n    }\n    handle {\n        reverse_proxy ${nginxName}:80\n    }\n}`;
   }
   if (nginxSvcs.length > 0) {
     const [nginxName] = nginxSvcs[0];
-    return `${name}.kyesworld.com:80 {\n    reverse_proxy ${nginxName}:80\n}`;
+    return `${site} {\n    reverse_proxy ${nginxName}:80\n}`;
   }
   if (buildSvcs.length > 0) {
     const [svcName] = buildSvcs[0];
-    return `${name}.kyesworld.com:80 {\n    reverse_proxy ${svcName}:3000\n}`;
+    return `${site} {\n    reverse_proxy ${svcName}:3000\n}`;
   }
-  return `${name}.kyesworld.com:80 {\n    reverse_proxy ${name}:3000\n}`;
+  return `${site} {\n    reverse_proxy ${name}:3000\n}`;
 }
 
 // After upload: verify build contexts have Dockerfiles, volume sources exist,

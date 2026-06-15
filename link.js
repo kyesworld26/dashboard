@@ -2,7 +2,8 @@
 // number of times — each successful link ADDS a new dashboard account to the
 // same agent (different accounts will each see this server in their dashboard).
 //
-//   docker compose exec agent npm run link
+//   sudo dashboard-link            # native install (preferred)
+//   sudo node /opt/dashboard-agent/link.js
 //
 // Two ways to authenticate:
 //   1) Email + password  — for accounts that have a password.

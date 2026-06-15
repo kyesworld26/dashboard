@@ -6,8 +6,7 @@
   "scripts": {
     "start": "node tunnel.js",
     "api": "node server.js",
-    "link": "node link.js",
-    "token": "node token.js"
+    "link": "node link.js"
   },
   "dependencies": {
     "archiver": "^8.0.0",
