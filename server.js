@@ -27,31 +27,56 @@ function loadEnvFile(filePath) {
     });
   } catch {}
 }
-// Try all likely locations; first match for each key wins
-const _envDir = process.env.ENVS_DIR || path.join(process.env.SERVER_ROOT || '/home/server', 'envs');
-[
-  path.join(_envDir, '.dashboard-env'),
-  path.join(__dirname, '.dashboard-env'),
-  path.join(__dirname, '.env'),
-].forEach(loadEnvFile);
-
 const app = express();
 // Agent mode: the local API is bound to loopback only and reached exclusively
 // through the outbound tunnel (tunnel.js). It must never be publicly exposed.
 const PORT = process.env.AGENT_LOCAL_PORT || process.env.PORT || 37001;
 const BIND_HOST = process.env.AGENT_BIND_HOST || '127.0.0.1';
 
-const SERVER_ROOT = process.env.SERVER_ROOT
-  || (fsSync.existsSync('/home/server') ? '/home/server' : path.resolve(__dirname, '..'));
+// SERVER_ROOT is the directory holding the host's main docker-compose.yml
+// (alongside optional services/, envs/, Caddyfile). Set it explicitly via the
+// systemd unit if the host's compose lives somewhere unusual; otherwise we
+// auto-detect on startup so the agent reflects the ACTUAL host layout — never
+// a path baked in at the publisher's machine.
+function detectServerRoot() {
+  if (process.env.SERVER_ROOT) return process.env.SERVER_ROOT;
+  const composeNames = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
+  const hasCompose = (dir) => composeNames.some(n => { try { return fsSync.statSync(path.join(dir, n)).isFile(); } catch { return false; } });
+  // 1. Top-level common roots, shallowest wins.
+  for (const candidate of ['/root', '/srv', '/home/server']) {
+    if (hasCompose(candidate)) return candidate;
+  }
+  // 2. One level deep under /home and /opt (e.g. /home/alice, /opt/myapp).
+  for (const parent of ['/home', '/opt']) {
+    try {
+      for (const e of fsSync.readdirSync(parent, { withFileTypes: true })) {
+        if (!e.isDirectory()) continue;
+        const dir = path.join(parent, e.name);
+        if (hasCompose(dir)) return dir;
+      }
+    } catch {}
+  }
+  // 3. Last-resort default — most Linux servers admin as root.
+  return '/root';
+}
+
+const SERVER_ROOT = detectServerRoot();
 const SERVICES_DIR  = process.env.SERVICES_DIR || path.join(SERVER_ROOT, 'services');
 const ENVS_DIR      = process.env.ENVS_DIR || path.join(SERVER_ROOT, 'envs');
 const CADDYFILE     = process.env.CADDYFILE || path.join(SERVER_ROOT, 'Caddyfile');
 const MAIN_COMPOSE  = process.env.MAIN_COMPOSE || path.join(SERVER_ROOT, 'docker-compose.yml');
 
-// SSH target for terminal + host-level commands (the dashboard runs inside a
-// container, so "the server" is reached over SSH). Defaults to the host's
-// Tailscale IP; override with TERMINAL_SSH_HOST.
-const TERMINAL_SSH_HOST = process.env.TERMINAL_SSH_HOST || '100.120.147.125';
+// Try all likely locations for an env file; first match per key wins.
+[
+  path.join(ENVS_DIR, '.dashboard-env'),
+  path.join(__dirname, '.dashboard-env'),
+  path.join(__dirname, '.env'),
+].forEach(loadEnvFile);
+
+// Optional SSH target for terminals/host commands. Native installs use a
+// local PTY by default (terminals are real host shells already); SSH is only
+// used when TERMINAL_USE_SSH=true AND TERMINAL_SSH_HOST is explicitly set.
+const TERMINAL_SSH_HOST = process.env.TERMINAL_SSH_HOST || '';
 
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
@@ -407,9 +432,6 @@ function resolveServerPath(rawPath) {
   if (!rawPath) return null;
   const cleaned = String(rawPath).trim();
   if (!cleaned) return null;
-  if (cleaned.startsWith('/home/server/')) {
-    return path.join(SERVER_ROOT, cleaned.slice('/home/server/'.length));
-  }
   if (path.isAbsolute(cleaned)) return cleaned;
   return path.resolve(SERVER_ROOT, cleaned);
 }
@@ -2157,6 +2179,11 @@ if (process.env.NODE_ENV === 'production') {
 
 const server = app.listen(PORT, BIND_HOST, () => {
   console.log(`Agent local API running on ${BIND_HOST}:${PORT}`);
+  console.log(`Server root: ${SERVER_ROOT}  (main compose: ${MAIN_COMPOSE})`);
+  if (!fsSync.existsSync(MAIN_COMPOSE)) {
+    console.log(`  note: no compose file at ${MAIN_COMPOSE} — dashboard will show no services until SERVER_ROOT points at the right directory.`);
+    console.log(`  fix: sudo systemctl edit dashboard-agent  → add  Environment=SERVER_ROOT=/path/to/your/compose/dir`);
+  }
 });
 
 // ─── WebSocket terminal (ssh2 — no system SSH binary needed) ─────────────────
@@ -2199,10 +2226,10 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => { try { onClose && onClose(); } catch {} });
 
   // The terminal is a shell ON the agent itself — the machine you're "connected
-  // to" in the dashboard. The agent already runs on that machine, so just
-  // spawn a local PTY in its container. The compose file gives that container
-  // pid:host, the docker socket, and /home/server, so this shell can see host
-  // processes and manage the host's docker stack without an SSH detour.
+  // to" in the dashboard. With the native systemd install the agent runs as
+  // root on the host, so spawning a local PTY here gives the operator a real
+  // host shell that can see every process and manage the host's docker stack
+  // directly — no SSH detour needed.
   //
   // Opt-in SSH fallback (TERMINAL_USE_SSH=true) for setups that really do want
   // to reach a separate host — uses TERMINAL_SSH_HOST/USER/PORT/KEY_PATH.

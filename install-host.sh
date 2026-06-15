@@ -29,7 +29,10 @@ INSTALL_DIR=/opt/dashboard-agent
 DATA_DIR=/var/lib/dashboard-agent
 SERVICE_USER=root                                    # root so the terminal is a real host shell
 HUB_URL=${HUB_URL:-wss://dashboard.kyesworld.com/agent}
-SERVER_ROOT=${SERVER_ROOT:-/home/server}
+# SERVER_ROOT: directory holding this host's main docker-compose.yml. Leave
+# empty and the agent auto-detects on startup (scans /root, /srv, /home/*,
+# /opt/* for a compose file). Set explicitly only if your layout is unusual.
+SERVER_ROOT=${SERVER_ROOT:-}
 # Apex domain used when the agent auto-generates Caddy reverse-proxy blocks
 # (e.g. PUBLIC_BASE_DOMAIN=example.com → 'myservice.example.com:80 { ... }').
 # Empty = use the bare service name as the site address (safe default).
@@ -121,6 +124,8 @@ Environment=HUB_URL=$HUB_URL
 Environment=AGENT_DATA_DIR=$DATA_DIR
 Environment=SERVER_ROOT=$SERVER_ROOT
 Environment=PUBLIC_BASE_DOMAIN=$PUBLIC_BASE_DOMAIN
+# When SERVER_ROOT is empty the agent runs detectServerRoot() in server.js
+# and picks /root, /srv, /home/*, /opt/* — whichever has a docker-compose.yml.
 ExecStart=$(command -v node) $INSTALL_DIR/tunnel.js
 Restart=always
 RestartSec=5
