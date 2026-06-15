@@ -1,0 +1,6 @@
+# Force LF for everything in this repo — these files run on Linux servers,
+# and CRLF in shell scripts produces "/bin/bash^M: bad interpreter" errors.
+* text=auto eol=lf
+
+# Belt-and-suspenders: shell scripts are explicitly LF.
+*.sh text eol=lf

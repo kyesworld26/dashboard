@@ -1,0 +1,14 @@
+# Runtime / install state — these only exist on the target server, never in
+# the repo.
+data/
+node_modules/
+*.log
+
+# Credentials and pairing tokens left over from dev installs.
+agent.json
+pairing.txt
+.agent-env
+
+# OS noise
+.DS_Store
+Thumbs.db

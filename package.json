@@ -1,0 +1,21 @@
+{
+  "name": "dashboard-agent",
+  "version": "1.0.0",
+  "description": "Server agent — dials out to the dashboard hub and proxies local server management over a tunnel.",
+  "main": "tunnel.js",
+  "scripts": {
+    "start": "node tunnel.js",
+    "api": "node server.js",
+    "link": "node link.js",
+    "token": "node token.js"
+  },
+  "dependencies": {
+    "archiver": "^8.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "@homebridge/node-pty-prebuilt-multiarch": "^0.11.14",
+    "ssh2": "^1.16.0",
+    "ws": "^8.18.0",
+    "yaml": "^2.9.0"
+  }
+}
