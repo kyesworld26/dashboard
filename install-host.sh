@@ -94,6 +94,11 @@ for f in tunnel.js server.js link.js package.json; do
   cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/$f"
 done
 [[ -f "$SCRIPT_DIR/package-lock.json" ]] && cp "$SCRIPT_DIR/package-lock.json" "$INSTALL_DIR/" || true
+# Record the installed git rev (best-effort) so update-host.sh can detect
+# whether a re-pull would actually bring new code.
+if command -v git >/dev/null 2>&1 && [[ -d "$SCRIPT_DIR/.git" ]]; then
+  git -C "$SCRIPT_DIR" rev-parse --short HEAD > "$INSTALL_DIR/.installed-rev" 2>/dev/null || true
+fi
 
 echo "==> Installing npm dependencies..."
 cd "$INSTALL_DIR"
@@ -166,4 +171,10 @@ echo "    sudo journalctl -u dashboard-agent -f"
 echo ""
 echo "  Config (edit then 'systemctl restart dashboard-agent'):"
 echo "    /etc/systemd/system/dashboard-agent.service"
+echo ""
+echo "  Update later:"
+echo "    curl -fsSL https://raw.githubusercontent.com/kyesworld26/dashboard/main/update-host.sh | sudo bash"
+echo ""
+echo "  Uninstall:"
+echo "    curl -fsSL https://raw.githubusercontent.com/kyesworld26/dashboard/main/uninstall-host.sh | sudo bash"
 echo "============================================================"

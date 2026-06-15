@@ -43,7 +43,7 @@ function detectServerRoot() {
   const composeNames = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
   const hasCompose = (dir) => composeNames.some(n => { try { return fsSync.statSync(path.join(dir, n)).isFile(); } catch { return false; } });
   // 1. Top-level common roots, shallowest wins.
-  for (const candidate of ['/root', '/srv', '/home/server']) {
+  for (const candidate of ['/root', '/srv']) {
     if (hasCompose(candidate)) return candidate;
   }
   // 2. One level deep under /home and /opt (e.g. /home/alice, /opt/myapp).
@@ -197,10 +197,14 @@ async function getSystemUptime() {
 }
 
 // Find a usable SSH private key. Skips paths that exist but are not regular
-// files (e.g. a directory Docker created from a bad volume mount → EISDIR).
+// files (e.g. a directory created from a bad volume mount → EISDIR).
 function findSshKey() {
+  const homeDir = process.env.HOME || '/root';
   const candidates = [
     process.env.TERMINAL_SSH_KEY_PATH,
+    path.join(homeDir, '.ssh', 'id_rsa'),
+    path.join(homeDir, '.ssh', 'id_ed25519'),
+    path.join(homeDir, '.ssh', 'id_ecdsa'),
     path.join(SERVER_ROOT, '.ssh', 'id_rsa'),
     path.join(SERVER_ROOT, '.ssh', 'id_ed25519'),
     path.join(SERVER_ROOT, '.ssh', 'id_ecdsa'),
@@ -210,23 +214,6 @@ function findSshKey() {
       if (fsSync.statSync(p).isFile()) return fsSync.readFileSync(p);
     } catch {}
   }
-  return null;
-}
-
-// Default gateway IP — from inside a container this is the docker host
-function getDefaultGatewayIp() {
-  try {
-    const txt = fsSync.readFileSync('/proc/net/route', 'utf-8');
-    for (const line of txt.split('\n').slice(1)) {
-      const p = line.trim().split(/\s+/);
-      if (p.length >= 3 && p[1] === '00000000') {
-        const hex = p[2];
-        const ip = [hex.slice(6, 8), hex.slice(4, 6), hex.slice(2, 4), hex.slice(0, 2)]
-          .map(h => parseInt(h, 16)).join('.');
-        if (ip && ip !== '0.0.0.0') return ip;
-      }
-    }
-  } catch {}
   return null;
 }
 
@@ -241,31 +228,27 @@ function probeTcp(host, port, timeoutMs = 3000) {
   });
 }
 
-// The dashboard runs INSIDE a container on the server, so the host's Tailscale
-// IP may not be reachable from the docker bridge. Probe candidates that all
-// lead to the same machine and use the first one answering on the SSH port.
+// Optional SSH escape hatch — used only when the operator explicitly sets
+// TERMINAL_USE_SSH=true (e.g. to proxy commands from this agent to a separate
+// machine over SSH). The native install runs the agent as root on the host
+// already, so the default web terminal is a local PTY and this path is
+// dormant for almost everyone.
 let _sshHostCache = { host: null, ts: 0 };
 async function resolveSshHost() {
   const now = Date.now();
   if (_sshHostCache.host && now - _sshHostCache.ts < 5 * 60 * 1000) return _sshHostCache.host;
   const sshPort = parseInt(process.env.TERMINAL_SSH_PORT) || 22;
-  const candidates = [...new Set([
-    TERMINAL_SSH_HOST,            // e.g. the Tailscale IP
-    'host.docker.internal',       // docker host (needs extra_hosts: host-gateway)
-    getDefaultGatewayIp(),        // docker bridge gateway = the host
-  ].filter(Boolean))];
+  const candidates = [TERMINAL_SSH_HOST].filter(Boolean);
   for (const host of candidates) {
     if (await probeTcp(host, sshPort)) {
       _sshHostCache = { host, ts: now };
       return host;
     }
   }
-  // Nothing answered — fail fast with a useful message instead of letting the
-  // SSH handshake hang for 15s against a dead address.
   throw new Error(
-    `No SSH route to the host answered on port ${sshPort} (tried: ${candidates.join(', ')}). ` +
-    `TERMINAL_SSH_HOST is "${TERMINAL_SSH_HOST}"${process.env.TERMINAL_SSH_HOST ? ' (set in envs/.agent-env — update it if the server\'s IP changed)' : ''}. ` +
-    `Also check that sshd on the host allows connections from the docker network.`
+    `TERMINAL_USE_SSH is enabled but no SSH host responded on port ${sshPort}. ` +
+    `Set TERMINAL_SSH_HOST in the systemd unit (sudo systemctl edit dashboard-agent) ` +
+    `and make sure sshd on the target accepts the configured key.`
   );
 }
 
@@ -277,7 +260,7 @@ async function sshExec(command, timeoutMs = 15000) {
   if (!sshHost) throw new Error('TERMINAL_SSH_HOST not set');
 
   return new Promise((resolve, reject) => {
-    const sshUser    = process.env.TERMINAL_SSH_USER     || 'server';
+    const sshUser    = process.env.TERMINAL_SSH_USER     || 'root';
     const sshPort    = parseInt(process.env.TERMINAL_SSH_PORT) || 22;
 
     const conn = new (require('ssh2').Client)();
@@ -2264,7 +2247,7 @@ wss.on('connection', (ws, req) => {
 
   // ── Opt-in SSH fallback ───────────────────────────────────────────────────
   const sshHost    = TERMINAL_SSH_HOST;
-  const sshUser    = process.env.TERMINAL_SSH_USER || 'server';
+  const sshUser    = process.env.TERMINAL_SSH_USER || 'root';
   const sshPort    = parseInt(process.env.TERMINAL_SSH_PORT) || 22;
   const privateKey = sshHost && sshLib ? findSshKey() : null;
 
@@ -2316,7 +2299,7 @@ wss.on('connection', (ws, req) => {
   } else if (useSsh && !sshHost) {
     send('TERMINAL_USE_SSH is set but TERMINAL_SSH_HOST is empty.\r\n');
   } else if (useSsh && !privateKey) {
-    send(`Cannot read an SSH private key for ${sshUser}@${sshHost} (checked TERMINAL_SSH_KEY_PATH and ${SERVER_ROOT}/.ssh/{id_rsa,id_ed25519,id_ecdsa}).\r\n`);
+    send(`Cannot read an SSH private key for ${sshUser}@${sshHost} (checked TERMINAL_SSH_KEY_PATH, $HOME/.ssh/, and ${SERVER_ROOT}/.ssh/ for id_rsa / id_ed25519 / id_ecdsa).\r\n`);
   } else {
     send('No terminal backend available.\r\n');
   }
