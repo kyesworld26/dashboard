@@ -12,3 +12,6 @@ pairing.txt
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Temp files used by the assistant to pass multi-line commit messages
+.commit-msg.tmp
