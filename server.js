@@ -63,8 +63,30 @@ function detectServerRoot() {
 const SERVER_ROOT = detectServerRoot();
 const SERVICES_DIR  = process.env.SERVICES_DIR || path.join(SERVER_ROOT, 'services');
 const ENVS_DIR      = process.env.ENVS_DIR || path.join(SERVER_ROOT, 'envs');
-const CADDYFILE     = process.env.CADDYFILE || path.join(SERVER_ROOT, 'Caddyfile');
-const MAIN_COMPOSE  = process.env.MAIN_COMPOSE || path.join(SERVER_ROOT, 'docker-compose.yml');
+// MAIN_COMPOSE and CADDYFILE are `let` because they're user-selectable at
+// runtime from the dashboard ("Active Config Files" section). The chosen paths
+// are persisted to CONFIG_PATH and re-applied on startup below. Defaults come
+// from the env (for systemd-pinned installs) or the detected SERVER_ROOT.
+let CADDYFILE     = process.env.CADDYFILE || path.join(SERVER_ROOT, 'Caddyfile');
+let MAIN_COMPOSE  = process.env.MAIN_COMPOSE || path.join(SERVER_ROOT, 'docker-compose.yml');
+
+// Where the dashboard persists the operator's chosen main compose / Caddyfile.
+const CONFIG_PATH = process.env.DASHBOARD_CONFIG || path.join(ENVS_DIR, '.dashboard-config.json');
+
+function loadRuntimeConfig() {
+  try {
+    const cfg = JSON.parse(fsSync.readFileSync(CONFIG_PATH, 'utf-8'));
+    return (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) ? cfg : {};
+  } catch { return {}; }
+}
+
+// A path the operator explicitly picked in the UI wins over the env/default so
+// the "select main docker-compose & Caddyfile" section is authoritative.
+(function applyRuntimeConfig() {
+  const cfg = loadRuntimeConfig();
+  if (cfg.mainCompose) MAIN_COMPOSE = cfg.mainCompose;
+  if (cfg.caddyfile)   CADDYFILE   = cfg.caddyfile;
+})();
 
 // Try all likely locations for an env file; first match per key wins.
 [
@@ -1047,7 +1069,15 @@ async function findEnvPath(name) {
   return path.join(ENVS_DIR, `.${name}-env`);
 }
 
-// Service compose: own docker-compose.yml if it exists, else main compose
+// Resolve which compose file + service name a host command should target.
+//
+// Hard rule: every build/start/stop/restart goes through the SERVER'S main
+// docker-compose. We never run a docker-compose.yml that lives inside a
+// service folder — doing so spins the service up under its own throwaway
+// compose project (separate network, no Caddy wiring, duplicate containers),
+// which is exactly the bug this guards against. If the service isn't wired
+// into the main compose yet, we fail loudly instead of silently using the
+// in-service file.
 async function getComposeArgs(name) {
   if (!isSafeName(name)) throw new Error('Invalid service name.');
   const mainServices = await getMainComposeServices();
@@ -1059,13 +1089,20 @@ async function getComposeArgs(name) {
   if (caddyStatic && mainServices.caddy) {
     return { file: MAIN_COMPOSE, service: 'caddy', source: 'caddy-static' };
   }
+
+  // Not in the main compose. Give a precise reason so the operator knows what to do.
   const ownPath = path.join(SERVICES_DIR, name, 'docker-compose.yml');
-  try {
-    await fs.access(ownPath);
-    return { file: ownPath, service: null, source: 'standalone' }; // standalone
-  } catch {
-    return { file: MAIN_COMPOSE, service: name, source: 'main' }; // main compose service
+  if (fsSync.existsSync(ownPath)) {
+    throw new Error(
+      `"${name}" has its own docker-compose.yml but is not defined in the server's main compose ` +
+      `(${MAIN_COMPOSE}). The dashboard never runs a service's own compose file — add the service ` +
+      `to the main docker-compose.yml (use the service's Compose tab) before starting it.`
+    );
   }
+  throw new Error(
+    `"${name}" is not defined in the server's main docker-compose (${MAIN_COMPOSE}). ` +
+    `Add a service entry for it before starting.`
+  );
 }
 
 function buildCmd(action, file, service) {
@@ -1379,10 +1416,11 @@ app.put('/api/services/:name/compose', async (req, res) => {
       return res.json({ success: true, output: `Updated Caddy service in ${MAIN_COMPOSE}` });
     }
 
-    const ownPath = path.join(SERVICES_DIR, name, 'docker-compose.yml');
-    await fs.mkdir(path.dirname(ownPath), { recursive: true });
-    await fs.writeFile(ownPath, content, 'utf-8');
-    res.json({ success: true, output: `Saved to ${ownPath}` });
+    // Service isn't in the main compose yet — wire it INTO the main compose
+    // rather than writing a standalone file the dashboard would never run.
+    const { sourceDoc, services } = extractServiceCompose(name, content);
+    await appendComposeServices(services, sourceDoc);
+    res.json({ success: true, output: `Added ${Object.keys(services).join(', ')} to ${MAIN_COMPOSE}` });
   } catch (err) {
     res.json({ success: false, error: err.message });
   }
@@ -1826,6 +1864,123 @@ app.put('/api/compose', async (req, res) => {
     YAML.parse(content || '');
     await fs.writeFile(MAIN_COMPOSE, content || '', 'utf-8');
     res.json({ success: true, output: `docker-compose.yml saved.` });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// ─── Active config-file selection ─────────────────────────────────────────────
+// Lets the operator pick WHICH docker-compose.yml and Caddyfile this agent
+// treats as the server's main config. The choice is persisted to CONFIG_PATH
+// and applied immediately (the module-level MAIN_COMPOSE / CADDYFILE are
+// reassigned, so every subsequent request uses the new paths).
+
+const COMPOSE_FILE_NAMES = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
+const CADDY_FILE_NAMES   = ['Caddyfile'];
+const DISCOVERY_SKIP_DIRS = new Set(['node_modules', '.git', 'vendor', 'dist', 'build', '.cache', 'tmp', '__pycache__', 'snap']);
+
+// Walk likely host roots (depth-limited) collecting compose files and Caddyfiles.
+async function discoverConfigFiles() {
+  const composeFiles = new Set();
+  const caddyFiles   = new Set();
+
+  const scanRoots = new Set([SERVER_ROOT, '/root', '/srv', '/opt', '/home']);
+  for (const parent of ['/home', '/opt']) {
+    try {
+      for (const e of await fs.readdir(parent, { withFileTypes: true })) {
+        if (e.isDirectory()) scanRoots.add(path.join(parent, e.name));
+      }
+    } catch {}
+  }
+
+  async function walk(dir, depth) {
+    if (depth > 4) return;
+    let entries;
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isFile()) {
+        if (COMPOSE_FILE_NAMES.includes(e.name)) composeFiles.add(path.join(dir, e.name));
+        else if (CADDY_FILE_NAMES.includes(e.name)) caddyFiles.add(path.join(dir, e.name));
+      } else if (e.isDirectory() && !DISCOVERY_SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) {
+        await walk(path.join(dir, e.name), depth + 1);
+      }
+    }
+  }
+  for (const root of scanRoots) await walk(root, 0);
+
+  // Always surface the current selections even if the scan missed them.
+  composeFiles.add(MAIN_COMPOSE);
+  caddyFiles.add(CADDYFILE);
+
+  return {
+    composeFiles: [...composeFiles].sort((a, b) => a.localeCompare(b)),
+    caddyFiles:   [...caddyFiles].sort((a, b) => a.localeCompare(b)),
+  };
+}
+
+function configState() {
+  return {
+    mainCompose: MAIN_COMPOSE,
+    caddyfile: CADDYFILE,
+    serverRoot: SERVER_ROOT,
+    servicesDir: SERVICES_DIR,
+    envsDir: ENVS_DIR,
+    composeExists: fsSync.existsSync(MAIN_COMPOSE),
+    caddyExists: fsSync.existsSync(CADDYFILE),
+    composePinnedByEnv: !!process.env.MAIN_COMPOSE,
+    caddyPinnedByEnv: !!process.env.CADDYFILE,
+    configPath: CONFIG_PATH,
+  };
+}
+
+// GET /api/config — current selection + path facts.
+app.get('/api/config', async (req, res) => {
+  res.json({ success: true, ...configState() });
+});
+
+// GET /api/config/discover — candidate compose files & Caddyfiles on the host.
+app.get('/api/config/discover', async (req, res) => {
+  try {
+    res.json({ success: true, ...(await discoverConfigFiles()) });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// PUT /api/config — choose the main compose / Caddyfile. Body: { mainCompose, caddyfile }.
+app.put('/api/config', async (req, res) => {
+  const { mainCompose, caddyfile } = req.body || {};
+  try {
+    const cfg = loadRuntimeConfig();
+    const warnings = [];
+
+    if (mainCompose !== undefined) {
+      const p = String(mainCompose).trim();
+      if (!p) throw new Error('Main compose path cannot be empty.');
+      if (!path.isAbsolute(p)) throw new Error('Main compose path must be absolute.');
+      if (!fsSync.existsSync(p)) warnings.push(`Compose file "${p}" does not exist yet.`);
+      cfg.mainCompose = p;
+      MAIN_COMPOSE = p;
+    }
+
+    if (caddyfile !== undefined) {
+      const p = String(caddyfile).trim();
+      if (!p) throw new Error('Caddyfile path cannot be empty.');
+      if (!path.isAbsolute(p)) throw new Error('Caddyfile path must be absolute.');
+      if (!fsSync.existsSync(p)) warnings.push(`Caddyfile "${p}" does not exist yet.`);
+      cfg.caddyfile = p;
+      CADDYFILE = p;
+    }
+
+    await fs.mkdir(path.dirname(CONFIG_PATH), { recursive: true });
+    await fs.writeFile(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', 'utf-8');
+
+    res.json({
+      success: true,
+      output: 'Active config files updated.',
+      warnings,
+      ...configState(),
+    });
   } catch (err) {
     res.json({ success: false, error: err.message });
   }
