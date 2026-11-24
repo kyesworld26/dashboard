@@ -150,6 +150,53 @@ function networkNames(nets) {
   return [];
 }
 
+// Other compose services a service cannot run without.
+function serviceDependencies(def) {
+  if (!def || typeof def !== 'object') return [];
+  const out = new Set();
+  const dep = def.depends_on;
+  if (Array.isArray(dep)) dep.forEach(d => out.add(String(d)));
+  else if (dep && typeof dep === 'object') Object.keys(dep).forEach(d => out.add(d));
+  for (const l of Array.isArray(def.links) ? def.links : []) out.add(String(l).split(':')[0]);
+  for (const v of Array.isArray(def.volumes_from) ? def.volumes_from : []) {
+    const s = String(v);
+    if (!s.startsWith('container:')) out.add(s.split(':')[0]);
+  }
+  if (typeof def.network_mode === 'string' && def.network_mode.startsWith('service:')) out.add(def.network_mode.slice(8));
+  return [...out].filter(Boolean);
+}
+
+// Extend the service group with everything it depends on (transitively), so
+// e.g. "chat-backend → chat-db" moves together. A dependency that services
+// OUTSIDE the group also need cannot be moved without breaking them, and a
+// dependency missing from the compose file is already broken: both are
+// reported as blockers instead of producing an invalid destination project.
+function withDependencies(group, services) {
+  const included = new Set(group);
+  const blockers = [];
+  const queue = [...group];
+  while (queue.length) {
+    const svc = queue.shift();
+    for (const d of serviceDependencies(services[svc])) {
+      if (included.has(d)) continue;
+      if (!Object.prototype.hasOwnProperty.call(services, d)) {
+        blockers.push(`"${svc}" depends on "${d}", which is not defined in the compose file.`);
+        continue;
+      }
+      included.add(d);
+      queue.push(d);
+    }
+  }
+  for (const d of included) {
+    if (group.includes(d)) continue;
+    const others = Object.keys(services).filter(s => !included.has(s) && serviceDependencies(services[s]).includes(d));
+    if (others.length) {
+      blockers.push(`"${d}" is needed by this service but is also used by ${others.map(o => `"${o}"`).join(', ')}; moving it would break them.`);
+    }
+  }
+  return { related: [...included], blockers };
+}
+
 // Ports with a listening socket on this host (Linux /proc; empty elsewhere).
 function listeningPorts() {
   const set = new Set();
@@ -341,7 +388,8 @@ function register(app, ctx) {
   async function collectSource(service) {
     const doc = await ctx.readComposeDoc();
     const services = doc.services && typeof doc.services === 'object' ? doc.services : {};
-    const related = await ctx.getRelatedServiceNames(service, services);
+    const deps = withDependencies(await ctx.getRelatedServiceNames(service, services), services);
+    const related = deps.related;
     const serviceDir = path.join(ctx.SERVICES_DIR, service);
     const dirExists = isDir(serviceDir);
     if (!related.length && !dirExists) fail(404, `Service "${service}" was not found on this server.`);
@@ -356,7 +404,7 @@ function register(app, ctx) {
     const externalBinds = [];
     const envPaths = new Set();
     const networks = new Set();
-    const blockers = [];
+    const blockers = [...deps.blockers];
 
     for (const svc of related) {
       const def = services[svc] && typeof services[svc] === 'object' ? services[svc] : {};
@@ -895,6 +943,14 @@ function register(app, ctx) {
     for (const [svc, d] of Object.entries(man.compose.services)) {
       defs[svc] = substitute(d, { serviceDirRel: rel(destServiceDir), envRel: b => rel(path.join(ctx.ENVS_DIR, b)) });
     }
+    // Every dependency must resolve here, or compose rejects the whole
+    // project (which would also break every other service on this server).
+    const destDoc = await ctx.readComposeDoc().catch(() => ({}));
+    const destServices = destDoc && destDoc.services && typeof destDoc.services === 'object' ? destDoc.services : {};
+    for (const [svc, d] of Object.entries(defs)) {
+      const missing = serviceDependencies(d).filter(dep => !defs[dep] && !Object.prototype.hasOwnProperty.call(destServices, dep));
+      if (missing.length) fail(409, `"${svc}" depends on ${missing.map(m => `"${m}"`).join(', ')}, which is not part of this transfer or this server.`);
+    }
     const beforeVols = await topLevelKeys('volumes');
     const beforeNets = await topLevelKeys('networks');
     try { await fs.copyFile(ctx.MAIN_COMPOSE, path.join(dir, 'compose.before.yml')); } catch {}
@@ -1035,7 +1091,12 @@ function register(app, ctx) {
         // Keep the journal and Compose entries intact when a container remains.
         if (errors.length) return { ok: false, steps, errors };
       }
-      for (const v of journal.volumes || []) await attempt(`removed volume ${v}`, () => ctx.execCmd(`${D} volume rm ${q(v)}`, 60_000));
+      // Idempotent: a volume an earlier attempt already removed is done, not a
+      // failure (otherwise a retried rollback could never complete).
+      for (const v of journal.volumes || []) await attempt(`removed volume ${v}`, async () => {
+        try { await ctx.execCmd(`${D} volume rm ${q(v)}`, 60_000); }
+        catch (err) { if (!/no such volume/i.test(`${err.message} ${err.stderr || ''}`)) throw err; }
+      });
       if ((journal.caddyBlocks || []).length) {
         let removed = false;
         await attempt('removed Caddy blocks', async () => {
@@ -1132,7 +1193,9 @@ function register(app, ctx) {
       if (existing.role !== 'source' || existing.service !== service) fail(409, 'Transfer id already used for something else.');
       if (existing.status === 'running' || (existing.status === 'done' && existing.stage === 'exported')) return res.json({ success: true, job: publicJob(existing) });
     }
-    const related = await ctx.getRelatedServiceNames(service);
+    const doc = await ctx.readComposeDoc();
+    const allServices = doc.services && typeof doc.services === 'object' ? doc.services : {};
+    const { related } = withDependencies(await ctx.getRelatedServiceNames(service, allServices), allServices);
     acquireLock(service, id, 'source', related.length ? related : [service]);
     const job = existing || { id, role: 'source', service, stage: 'queued', stopped: [], wasRunning: false };
     runInBackground(job, async j => {

@@ -70,6 +70,15 @@ function compose(argv) {
   const services = doc.services || {};
   const project = projectOf(file, doc);
   const targets = names.length ? names : Object.keys(services);
+  // Like real compose: a dangling dependency invalidates the whole project,
+  // whatever subcommand is run.
+  for (const [svc, def] of Object.entries(services)) {
+    const dep = def && def.depends_on;
+    const deps = [...(Array.isArray(dep) ? dep : dep && typeof dep === 'object' ? Object.keys(dep) : []),
+      ...(Array.isArray(def && def.links) ? def.links.map(l => String(l).split(':')[0]) : [])];
+    const missing = deps.find(d => !services[d]);
+    if (missing) die(`service "${svc}" depends on undefined service "${missing}": invalid compose project`);
+  }
   return withLock(() => {
     const s = load();
     const find = svc => s.containers.find(c => c.project === project && c.service === svc);

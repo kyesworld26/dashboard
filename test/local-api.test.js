@@ -359,3 +359,46 @@ test('rollback also removes a transferred container whose compose path label dif
   assert.equal(ok.json.ok, true, ok.text);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'docker', 'state.json'), 'utf-8')).containers, []);
 });
+
+test('a retried rollback treats volumes that are already gone as removed', async () => {
+  const id = crypto.randomUUID();
+  const name = 'retry-volume';
+  const init = await req('POST', `/api/transfer/${id}/receive/init`, { body: { service: name, size: 10, sha256: 'd'.repeat(64) } });
+  assert.equal(init.status, 200, init.text);
+  const dir = path.join(root, 'data', 'transfers', id);
+  fs.writeFileSync(path.join(dir, 'journal.json'), JSON.stringify({
+    serviceDir: null, envFiles: [], composeServices: [name], topVolumes: [], topNetworks: [], caddyBlocks: [],
+    containers: [name], volumes: ['proj-test_already-removed'],
+  }));
+  writeState({ containers: [], volumes: {}, networks: ['bridge'] });
+  const r = await req('POST', `/api/transfer/${id}/rollback`, { body: { service: name } });
+  assert.equal(r.json.ok, true, r.text);
+  assert.equal(fs.existsSync(dir), false, 'lock and staging released');
+});
+
+test('transfers include compose dependencies; shared or missing dependencies are blockers', async () => {
+  const doc = compose();
+  Object.assign(doc.services, {
+    'deps-app': { build: './services/deps-app', depends_on: ['deps-db'] },
+    'deps-db': { image: 'postgres:16-alpine', volumes: ['depsdata:/var/lib/postgresql/data'] },
+    'shared-a': { build: './services/shared-a', depends_on: { 'shared-db': { condition: 'service_started' } } },
+    'shared-db': { image: 'postgres:16-alpine' },
+    'other-user': { image: 'nginx', depends_on: ['shared-db'] },
+    'broken-app': { build: './services/broken-app', links: ['nope:alias'] },
+  });
+  doc.volumes = { ...(doc.volumes || {}), depsdata: {} };
+  fs.writeFileSync(path.join(root, 'server', 'docker-compose.yml'), YAML.stringify(doc));
+  for (const d of ['deps-app', 'shared-a', 'broken-app']) fs.mkdirSync(path.join(root, 'server', 'services', d), { recursive: true });
+  writeState({ containers: [], volumes: {}, networks: ['bridge'] });
+
+  const deps = await req('POST', '/api/transfer/inspect', { body: { service: 'deps-app' } });
+  assert.equal(deps.status, 200, deps.text);
+  assert.deepEqual([...deps.json.summary.relatedServices].sort(), ['deps-app', 'deps-db'], 'the database moves with the app');
+  assert.deepEqual(deps.json.summary.blockers, []);
+
+  const shared = await req('POST', '/api/transfer/inspect', { body: { service: 'shared-a' } });
+  assert.ok(shared.json.summary.blockers.some(b => /"shared-db".*also used by "other-user"/.test(b)), JSON.stringify(shared.json.summary.blockers));
+
+  const broken = await req('POST', '/api/transfer/inspect', { body: { service: 'broken-app' } });
+  assert.ok(broken.json.summary.blockers.some(b => /"nope", which is not defined/.test(b)));
+});
