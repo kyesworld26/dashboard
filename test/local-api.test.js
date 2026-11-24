@@ -260,6 +260,49 @@ test('transfers can be disabled per direction on the server itself', async () =>
   assert.equal((await req('POST', '/api/transfer/inspect', { body: { service: '../etc' } })).status, 400);
 });
 
+test('transfer rollback reports Docker errors and retries after Compose entry is gone', async () => {
+  const id = crypto.randomUUID();
+  const name = 'retry-test';
+  const composeFile = path.join(root, 'server', 'docker-compose.yml');
+  const init = await req('POST', `/api/transfer/${id}/receive/init`, {
+    body: { service: name, size: 10, sha256: 'b'.repeat(64) },
+  });
+  assert.equal(init.status, 200, init.text);
+  const dir = path.join(root, 'data', 'transfers', id);
+  fs.writeFileSync(path.join(dir, 'journal.json'), JSON.stringify({
+    serviceDir: null, envFiles: [], composeServices: [name], topVolumes: [],
+    topNetworks: [], caddyBlocks: [], containers: [name], volumes: [],
+  }));
+  const doc = compose();
+  doc.services[name] = { image: 'synthetic:test' };
+  fs.writeFileSync(composeFile, YAML.stringify(doc));
+  const original = { ...ctr('e'.repeat(64), 'proj-test-retry-test-1', 'proj-test', name),
+    CreatedAt: new Date().toISOString(), composeConfigFile: composeFile };
+  const unrelated = { ...ctr('f'.repeat(64), 'other-retry-test-1', 'other', name),
+    CreatedAt: new Date().toISOString(), composeConfigFile: path.join(root, 'other-compose.yml') };
+  writeState({ containers: [original, unrelated], volumes: {}, networks: ['bridge'], failDockerRm: [name] });
+
+  const first = await req('POST', `/api/transfer/${id}/rollback`, { body: { service: name } });
+  assert.equal(first.status, 200, first.text);
+  assert.equal(first.json.ok, false);
+  assert.match(first.json.errors.join(' '), /fake docker rm failure/);
+  assert.ok(compose().services[name], 'the Compose entry remains for another attempt');
+  assert.ok(fs.existsSync(path.join(dir, 'journal.json')));
+
+  const state = JSON.parse(fs.readFileSync(path.join(root, 'docker', 'state.json'), 'utf-8'));
+  delete state.failDockerRm;
+  writeState(state);
+  const partlyCleaned = compose();
+  delete partlyCleaned.services[name];
+  fs.writeFileSync(composeFile, YAML.stringify(partlyCleaned));
+  const second = await req('POST', `/api/transfer/${id}/rollback`, { body: { service: name } });
+  assert.equal(second.status, 200, second.text);
+  assert.equal(second.json.ok, true, second.text);
+  const remaining = JSON.parse(fs.readFileSync(path.join(root, 'docker', 'state.json'), 'utf-8')).containers;
+  assert.deepEqual(remaining.map(c => c.ID), [unrelated.ID]);
+  assert.equal(fs.existsSync(dir), false);
+});
+
 test('transfer preflight checks the running Caddy and its mounted Caddyfile', async () => {
   const summary = {
     service: 'incoming-site', relatedServices: ['incoming-site'],

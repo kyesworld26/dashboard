@@ -91,7 +91,7 @@ function compose(argv) {
           s.volumeLabels[name] ||= { 'com.docker.compose.project': project, 'com.docker.compose.volume': src };
           mounts.push({ Type: 'volume', Name: name, Destination: target });
         }
-        c = { ID: crypto.randomBytes(32).toString('hex'), Names: def.container_name || `${project}-${svc}-1`, project, service: svc,
+        c = { ID: crypto.randomBytes(32).toString('hex'), Names: def.container_name || `${project}-${svc}-1`, project, service: svc, composeConfigFile: file,
               Image: def.image || `${project}-${svc}`, CreatedAt: new Date().toISOString(), mounts, labels: labelsOf(def) };
         setState(c, 'created');
         s.containers.push(c);
@@ -162,6 +162,12 @@ switch (cmd) {
   case 'compose': compose(rest); break;
   case 'ps': {
     const s = load();
+    if (rest.includes('-aq') || (rest.includes('-a') && rest.includes('-q'))) {
+      const filter = rest[rest.indexOf('--filter') + 1] || '';
+      const service = filter.startsWith('label=com.docker.compose.service=') ? filter.slice('label=com.docker.compose.service='.length) : null;
+      out(s.containers.filter(c => !service || c.service === service).map(c => c.ID).join('\n') + '\n');
+      break;
+    }
     if (rest.includes('-q')) { out(s.containers.filter(c => c.State === 'running').map(c => c.ID.slice(0, 12)).join('\n') + '\n'); break; }
     for (const c of s.containers) out(JSON.stringify(psRow(c)) + '\n');
     break;
@@ -202,7 +208,18 @@ switch (cmd) {
     const s = load();
     const c = s.containers.find(x => x.ID === rest[rest.length - 1]);
     if (!c) die('no such container');
-    out(JSON.stringify(c.mounts) + '\n');
+    if (rest.includes('--format')) out(JSON.stringify(c.mounts) + '\n');
+    else out(JSON.stringify([{ Created: c.CreatedAt, Config: { Labels: {
+      'com.docker.compose.project.config_files': c.composeConfigFile,
+      'com.docker.compose.service': c.service,
+    } } }]) + '\n');
+    break;
+  }
+  case 'rm': {
+    withLock(() => { const s = load(); const ids = rest.filter(a => !a.startsWith('-'));
+      if (s.containers.some(c => ids.includes(c.ID) && (s.failDockerRm || []).includes(c.service))) die('fake docker rm failure');
+      s.containers = s.containers.filter(c => !ids.includes(c.ID)); save(s);
+    });
     break;
   }
   case 'start': case 'stop': case 'restart': case 'kill': {

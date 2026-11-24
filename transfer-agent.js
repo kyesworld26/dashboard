@@ -984,6 +984,26 @@ function register(app, ctx) {
   }
 
   // Undo exactly what the journal says this transfer created. Idempotent.
+  async function removeTransferredContainers(service, services) {
+    const lock = locks.get(service);
+    for (const svc of services) {
+      const { stdout } = await ctx.execCmd(`${D} ps -aq --filter ${q(`label=com.docker.compose.service=${svc}`)}`);
+      for (const id of stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
+        const inspected = JSON.parse((await ctx.execCmd(`${D} inspect ${q(id)}`)).stdout)[0];
+        const labels = inspected?.Config?.Labels || {};
+        const files = String(labels['com.docker.compose.project.config_files'] || '').split(',');
+        if (!files.includes(ctx.MAIN_COMPOSE)) continue;
+        // Older journals only recorded service names. The destination lock and
+        // Compose labels establish that this container belongs to this attempt.
+        if (!lock || !Date.parse(lock.at) || !Date.parse(inspected.Created)
+            || Date.parse(inspected.Created) < Date.parse(lock.at) - 60_000) {
+          fail(409, `Cannot verify that container ${id} belongs to this transfer.`);
+        }
+        await ctx.execCmd(`${D} rm -f ${q(id)}`, 300_000);
+      }
+    }
+  }
+
   async function rollbackDestination(id, service) {
     const journal = await loadJournal(id);
     const steps = [];
@@ -992,7 +1012,11 @@ function register(app, ctx) {
     if (journal) {
       const added = journal.composeServices || [];
       const toRemove = (journal.containers || []).filter(s => added.includes(s));
-      if (toRemove.length) await attempt(`removed containers ${toRemove.join(', ')}`, () => ctx.execCmd(`${D} compose -f ${q(ctx.MAIN_COMPOSE)} rm -sf ${toRemove.map(q).join(' ')}`, 300_000));
+      if (toRemove.length) {
+        await attempt(`removed containers ${toRemove.join(', ')}`, () => removeTransferredContainers(service, toRemove));
+        // Keep the journal and Compose entries intact when a container remains.
+        if (errors.length) return { ok: false, steps, errors };
+      }
       for (const v of journal.volumes || []) await attempt(`removed volume ${v}`, () => ctx.execCmd(`${D} volume rm ${q(v)}`, 60_000));
       if ((journal.caddyBlocks || []).length) {
         let removed = false;

@@ -147,7 +147,10 @@ app.use(express.json({ limit: process.env.AGENT_BODY_LIMIT || '50mb' }));
 function execCmd(cmd, timeout = 60000) {
   return new Promise((resolve, reject) => {
     exec(cmd, { maxBuffer: 10 * 1024 * 1024, timeout }, (error, stdout, stderr) => {
-      if (error) reject({ error: error.message, stderr, code: error.code });
+      if (error) {
+        const detail = String(stderr || '').trim().split(/\r?\n/).filter(Boolean).at(-1);
+        reject(Object.assign(new Error(detail || error.message), { error: error.message, stderr, code: error.code }));
+      }
       else resolve({ stdout, stderr });
     });
   });
