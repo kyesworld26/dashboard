@@ -1361,6 +1361,71 @@ async function removeMainComposeService(composeName) {
 }
 
 // Env files referenced by any service in `services` (absolute paths).
+function namedVolumeSources(def) {
+  const sources = new Set();
+  for (const mount of Array.isArray(def?.volumes) ? def.volumes : []) {
+    if (typeof mount === 'string') {
+      const parts = mount.split(':');
+      if (parts.length > 1 && parts[0] && !/^[./~]/.test(parts[0])) sources.add(parts[0]);
+    } else if (mount && typeof mount === 'object' && mount.type !== 'bind' && mount.type !== 'tmpfs' && mount.source) {
+      sources.add(mount.source);
+    }
+  }
+  return sources;
+}
+
+function volumesToDelete(doc, relatedNames) {
+  const deleting = new Set(relatedNames);
+  const retained = new Set();
+  const candidates = new Set();
+  for (const [service, def] of Object.entries(doc.services || {})) {
+    for (const source of namedVolumeSources(def)) (deleting.has(service) ? candidates : retained).add(source);
+  }
+  const project = composeProjectName(doc);
+  const actualName = source => {
+    const top = doc.volumes?.[source];
+    if (top && typeof top === 'object' && top.name) return top.name;
+    return top && typeof top === 'object' && top.external ? source : project + '_' + source;
+  };
+  const retainedNames = new Set([...retained].map(actualName));
+  const selected = [...candidates].filter(source => !retained.has(source) && !retainedNames.has(actualName(source)));
+  const nameCounts = new Map();
+  for (const source of selected) nameCounts.set(actualName(source), (nameCounts.get(actualName(source)) || 0) + 1);
+  return selected.map(source => {
+    const top = doc.volumes?.[source];
+    if (!Object.prototype.hasOwnProperty.call(doc.volumes || {}, source) || !isSafeName(source)) {
+      return { source, skip: 'not a declared, safe Compose volume' };
+    }
+    if (top && typeof top === 'object' && top.external) return { source, skip: 'external volume' };
+    const name = actualName(source);
+    if (!isSafeName(name)) return { source, skip: 'volume name cannot be safely resolved' };
+    if (nameCounts.get(name) > 1) return { source, skip: 'multiple Compose names resolve to the same volume' };
+    return { source, actualName: name, project };
+  });
+}
+
+async function removeMainComposeVolume(name) {
+  const content = await readTextIfExists(MAIN_COMPOSE);
+  const lines = content.replace(/\r\n/g, '\n').split('\n');
+  const range = getTopLevelBlockRange(lines, 'volumes');
+  if (!range) return false;
+  const entryStart = lines.findIndex((line, i) =>
+    i > range.start && i < range.end &&
+    new RegExp('^  ' + escapeRegex(name) + ':\\s*').test(line)
+  );
+  if (entryStart === -1) return false;
+  let entryEnd = range.end;
+  for (let i = entryStart + 1; i < range.end; i++) {
+    if (/^  [A-Za-z0-9_.-]+:\s*/.test(lines[i])) { entryEnd = i; break; }
+  }
+  lines.splice(entryStart, entryEnd - entryStart);
+  const remaining = lines.slice(range.start + 1, getTopLevelBlockRange(lines, 'volumes')?.end);
+  if (!remaining.some(line => /^  [A-Za-z0-9_.-]+:\s*/.test(line))) lines[range.start] = 'volumes: {}';
+  const next = lines.join('\n').replace(/\n{3,}/g, '\n\n');
+  await fs.writeFile(MAIN_COMPOSE, next.endsWith('\n') ? next : next + '\n', 'utf-8');
+  return true;
+}
+
 function envFilesReferenced(services) {
   const out = new Set();
   for (const def of Object.values(services || {})) {
@@ -1992,23 +2057,53 @@ app.delete('/api/services/:name', async (req, res) => {
     }
     // The env file(s) this service uses, resolved BEFORE compose is edited.
     const envPath = await findEnvPath(name);
-    const servicesBefore = await getMainComposeServices();
+    const doc = await readComposeDoc();
+    const servicesBefore = doc.services || {};
     const relatedNames = await getRelatedServiceNames(name, servicesBefore);
-
-    // 1. Stop + remove containers for all related services
-    for (const svcName of relatedNames) {
-      try {
-        const cmd = `${DOCKER} compose -f ${shQuote(MAIN_COMPOSE)} rm -sf ${shQuote(svcName)}`;
-        const { stdout, stderr } = await execCmd(cmd, 60000);
-        msgs.push(`Stopped/removed "${svcName}": ${(stdout + stderr).trim() || 'ok'}`);
-      } catch (e) { msgs.push(`Warn (container ${svcName}): ${e.error || e.message}`); }
+    const volumePlan = volumesToDelete(doc, relatedNames);
+    const listed = await execCmd(`${DOCKER} volume ls --format "{{.Name}}"`, 30000);
+    const existingVolumes = new Set(listed.stdout.split(/\r?\n/).filter(Boolean));
+    const removableVolumes = [];
+    for (const volume of volumePlan) {
+      if (volume.skip) {
+        if (volume.skip !== 'external volume') throw new Error(`Cannot safely delete volume "${volume.source}": ${volume.skip}.`);
+        msgs.push(`Kept external volume "${volume.source}"`);
+        continue;
+      }
+      if (!existingVolumes.has(volume.actualName)) {
+        msgs.push(`Volume "${volume.actualName}" already absent`);
+        removableVolumes.push(volume);
+        continue;
+      }
+      const inspected = await execCmd(`${DOCKER} volume inspect ${shQuote(volume.actualName)}`, 30000);
+      const labels = JSON.parse(inspected.stdout)[0]?.Labels || {};
+      if (labels['com.docker.compose.project'] !== volume.project ||
+          labels['com.docker.compose.volume'] !== volume.source) {
+        throw new Error(`Cannot safely delete volume "${volume.actualName}": ownership could not be verified.`);
+      }
+      removableVolumes.push(volume);
     }
 
-    // 2. Remove all related services from the main compose file
+    // Remove anonymous volumes with their containers. Named volumes need a
+    // separate, scoped removal after every related container is gone.
     for (const svcName of relatedNames) {
-      try {
-        if (await removeMainComposeService(svcName)) msgs.push(`Removed "${svcName}" from ${path.basename(MAIN_COMPOSE)}`);
-      } catch (e) { msgs.push(`Warn (compose ${svcName}): ${e.message}`); }
+      const cmd = `${DOCKER} compose -f ${shQuote(MAIN_COMPOSE)} rm -sfv ${shQuote(svcName)}`;
+      const { stdout, stderr } = await execCmd(cmd, 60000);
+      msgs.push(`Stopped/removed "${svcName}": ${(stdout + stderr).trim() || 'ok'}`);
+    }
+    for (const volume of removableVolumes) {
+      if (existingVolumes.has(volume.actualName)) {
+        await execCmd(`${DOCKER} volume rm ${shQuote(volume.actualName)}`, 60000);
+        msgs.push(`Deleted data volume "${volume.actualName}"`);
+      }
+    }
+
+    // Remove the definitions only after Docker confirms data cleanup.
+    for (const svcName of relatedNames) {
+      if (await removeMainComposeService(svcName)) msgs.push(`Removed "${svcName}" from ${path.basename(MAIN_COMPOSE)}`);
+    }
+    for (const volume of removableVolumes) {
+      if (await removeMainComposeVolume(volume.source)) msgs.push(`Removed volume definition "${volume.source}" from ${path.basename(MAIN_COMPOSE)}`);
     }
 
     // 3. Remove Caddy blocks
@@ -2045,7 +2140,7 @@ app.delete('/api/services/:name', async (req, res) => {
 
     res.json({ success: true, output: msgs.join('\n') });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message, output: msgs.join('\n') });
+    res.status(500).json({ success: false, error: err.error || err.message, output: msgs.join('\n') });
   }
 });
 

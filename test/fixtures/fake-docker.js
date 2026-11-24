@@ -87,6 +87,8 @@ function compose(argv) {
           const top = (doc.volumes || {})[src] || {};
           const name = top.name || `${project}_${src}`;
           if (!s.volumes[name]) { s.volumes[name] = path.join(VOL_ROOT, name); fs.mkdirSync(s.volumes[name], { recursive: true }); }
+          s.volumeLabels ||= {};
+          s.volumeLabels[name] ||= { 'com.docker.compose.project': project, 'com.docker.compose.volume': src };
           mounts.push({ Type: 'volume', Name: name, Destination: target });
         }
         c = { ID: crypto.randomBytes(32).toString('hex'), Names: def.container_name || `${project}-${svc}-1`, project, service: svc,
@@ -105,7 +107,20 @@ function compose(argv) {
       case 'restart': for (const svc of targets) { const c = find(svc); if (c) startOne(c); } break;
       case 'stop': for (const svc of targets) { const c = find(svc); if (c) setState(c, 'exited'); } break;
       case 'down': s.containers = s.containers.filter(c => c.project !== project); break;
-      case 'rm': s.containers = s.containers.filter(c => !(c.project === project && targets.includes(c.service))); break;
+      case 'rm':
+        if (targets.some(svc => (s.failComposeRm || []).includes(svc))) die('fake compose rm failure');
+        if (flags.includes('--volumes') || flags.some(flag => /^-[a-z]+$/.test(flag) && flag.includes('v'))) {
+          for (const c of s.containers.filter(c => c.project === project && targets.includes(c.service))) {
+            for (const mount of c.mounts || []) {
+              if (mount.Anonymous && s.volumes[mount.Name]) {
+                fs.rmSync(s.volumes[mount.Name], { recursive: true, force: true });
+                delete s.volumes[mount.Name];
+              }
+            }
+          }
+        }
+        s.containers = s.containers.filter(c => !(c.project === project && targets.includes(c.service)));
+        break;
       case 'pull': break;
       default: die(`fake compose: unsupported ${sub}`);
     }
@@ -166,8 +181,18 @@ switch (cmd) {
   case 'volume': {
     const s = load();
     if (rest[0] === 'ls') { out(Object.keys(s.volumes).join('\n') + (Object.keys(s.volumes).length ? '\n' : '')); break; }
-    if (rest[0] === 'rm') { withLock(() => { const st = load(); for (const n of rest.slice(1)) { if (st.volumes[n]) fs.rmSync(st.volumes[n], { recursive: true, force: true }); delete st.volumes[n]; } save(st); }); break; }
-    if (rest[0] === 'inspect') { const n = rest[rest.length - 1]; if (!s.volumes[n]) die(`no such volume ${n}`); out(s.volumes[n] + '\n'); break; }
+    if (rest[0] === 'rm') { withLock(() => { const st = load(); for (const n of rest.slice(1)) {
+      if ((st.failVolumeRm || []).includes(n)) die('fake volume rm failure');
+      if (st.containers.some(c => (c.mounts || []).some(m => m.Name === n))) die('volume is in use');
+      if (!st.volumes[n]) die('no such volume');
+      fs.rmSync(st.volumes[n], { recursive: true, force: true });
+      delete st.volumes[n];
+      if (st.volumeLabels) delete st.volumeLabels[n];
+    } save(st); }); break; }
+    if (rest[0] === 'inspect') { const n = rest[rest.length - 1]; if (!s.volumes[n]) die(`no such volume ${n}`);
+      if (rest.includes('--format')) out(s.volumes[n] + '\n');
+      else out(JSON.stringify([{ Name: n, Mountpoint: s.volumes[n], Labels: (s.volumeLabels || {})[n] || null }]) + '\n');
+      break; }
     die('fake volume: unsupported');
     break;
   }

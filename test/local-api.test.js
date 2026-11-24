@@ -75,13 +75,17 @@ before(async () => {
   fs.writeFileSync(path.join(root, 'server', 'docker-compose.yml'), YAML.stringify({
     name: 'proj-test',
     services: {
-      web: { build: './services/web', env_file: ['./envs/.shared-env'] },
+      web: { build: './services/web', env_file: ['./envs/.shared-env'],
+        volumes: ['webdata:/data', 'shared:/shared', 'external:/external',
+          { type: 'volume', source: 'custom', target: '/custom' }, 'exclusive:/exclusive'] },
       'web-static': { image: 'nginx:alpine', volumes: ['./services/web/public:/usr/share/nginx/html:ro'] },
       'web-proxy': { image: 'traefik' },
-      webdb: { image: 'postgres', env_file: ['./envs/.shared-env'] },
+      webdb: { image: 'postgres', env_file: ['./envs/.shared-env'], volumes: ['shared:/shared', 'alias:/alias'] },
       db: { image: 'postgres' },
       cafe: { image: 'cafe' },
     },
+    volumes: { webdata: {}, shared: {}, external: { external: true },
+      custom: { name: 'my-web-data' }, alias: { name: 'my-web-data' }, exclusive: { name: 'my-exclusive-data' } },
   }));
   port = await freePort();
   api = await startApi(root, port, { AGENT_LOCAL_TOKEN: TOKEN });
@@ -178,12 +182,72 @@ test('concurrent stats requests share one docker invocation', async () => {
 });
 
 test('deleting a service removes only its own compose services and keeps shared env files', async () => {
+  const volumeNames = ['proj-test_webdata', 'proj-test_shared', 'external', 'my-web-data', 'my-exclusive-data', 'anonymous-test-volume'];
+  const volumes = Object.fromEntries(volumeNames.map(n => [n, path.join(root, 'docker', 'volumes', n)]));
+  for (const dir of Object.values(volumes)) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'synthetic.txt'), 'test only');
+  }
+  const volumeLabels = Object.fromEntries([
+    ['proj-test_webdata', 'webdata'], ['proj-test_shared', 'shared'],
+    ['my-web-data', 'custom'], ['my-exclusive-data', 'exclusive'],
+  ].map(([n, source]) => [n, { 'com.docker.compose.project': 'proj-test', 'com.docker.compose.volume': source }]));
+  writeState({ containers: [
+    { ...ctr('w'.repeat(64), 'proj-test-web-1', 'proj-test', 'web'),
+      mounts: [...['proj-test_webdata', 'proj-test_shared', 'external', 'my-web-data', 'my-exclusive-data'].map(Name => ({ Type: 'volume', Name })),
+        { Type: 'volume', Name: 'anonymous-test-volume', Anonymous: true }] },
+    ctr('s'.repeat(64), 'proj-test-web-static-1', 'proj-test', 'web-static'),
+    { ...ctr('d'.repeat(64), 'proj-test-webdb-1', 'proj-test', 'webdb'),
+      mounts: [{ Type: 'volume', Name: 'proj-test_shared' }, { Type: 'volume', Name: 'my-web-data' }] },
+  ], volumes, volumeLabels, networks: ['bridge'] });
   const r = await req('DELETE', '/api/services/web');
   assert.equal(r.status, 200, r.text);
   const services = Object.keys(compose().services).sort();
   assert.deepEqual(services, ['cafe', 'db', 'web-proxy', 'webdb'], 'web + web-static removed; web-proxy and webdb kept');
   assert.ok(fs.existsSync(path.join(root, 'server', 'envs', '.shared-env')), 'env still used by webdb is kept');
   assert.match(r.json.output, /Kept .*\.shared-env/);
+  const state = JSON.parse(fs.readFileSync(path.join(root, 'docker', 'state.json'), 'utf-8'));
+  assert.equal(state.volumes['proj-test_webdata'], undefined, 'owned named volume removed');
+  assert.equal(state.volumes['my-exclusive-data'], undefined, 'owned custom-name volume removed');
+  assert.equal(state.volumes['anonymous-test-volume'], undefined, 'anonymous volume removed with container');
+  assert.ok(state.volumes['proj-test_shared'], 'volume used by another service kept');
+  assert.ok(state.volumes['my-web-data'], 'same volume referenced under a different key is kept');
+  assert.ok(state.volumes.external, 'external volume kept');
+  assert.deepEqual(Object.keys(compose().volumes).sort(), ['alias', 'custom', 'external', 'shared']);
+  assert.ok(!fs.existsSync(volumes['proj-test_webdata']));
+  assert.match(r.json.output, /Deleted data volume "proj-test_webdata"/);
+});
+
+test('a volume deletion failure leaves the service definition and its files in place', async () => {
+  const doc = compose();
+  doc.services.db.volumes = ['dbdata:/data'];
+  doc.volumes.dbdata = {};
+  fs.writeFileSync(path.join(root, 'server', 'docker-compose.yml'), YAML.stringify(doc));
+  const dir = path.join(root, 'docker', 'volumes', 'proj-test_dbdata');
+  fs.mkdirSync(dir, { recursive: true });
+  writeState({ containers: [{ ...ctr('e'.repeat(64), 'proj-test-db-1', 'proj-test', 'db'),
+    mounts: [{ Type: 'volume', Name: 'proj-test_dbdata' }] }],
+    volumes: { 'proj-test_dbdata': dir },
+    volumeLabels: { 'proj-test_dbdata': { 'com.docker.compose.project': 'proj-test', 'com.docker.compose.volume': 'dbdata' } },
+    failVolumeRm: ['proj-test_dbdata'], networks: ['bridge'] });
+  const r = await req('DELETE', '/api/services/db?deleteFiles=true');
+  assert.equal(r.status, 500, r.text);
+  assert.ok(compose().services.db, 'Compose definition retained');
+  assert.ok(fs.existsSync(path.join(root, 'server', 'services', 'db')), 'service files retained');
+  assert.ok(fs.existsSync(dir), 'volume retained');
+  assert.match(r.json.error, /fake volume rm failure/);
+});
+
+test('deletion refuses a volume whose ownership cannot be verified', async () => {
+  const dir = path.join(root, 'docker', 'volumes', 'proj-test_dbdata');
+  writeState({ containers: [ctr('f'.repeat(64), 'proj-test-db-1', 'proj-test', 'db')],
+    volumes: { 'proj-test_dbdata': dir }, networks: ['bridge'] });
+  const r = await req('DELETE', '/api/services/db');
+  assert.equal(r.status, 500, r.text);
+  assert.match(r.json.error, /ownership could not be verified/);
+  assert.ok(compose().services.db);
+  assert.ok(fs.existsSync(dir));
+  assert.ok(!calls().slice(-2).some(c => c.includes('compose') && c.includes(' rm ')), 'container removal not attempted');
 });
 
 test('transfers can be disabled per direction on the server itself', async () => {
