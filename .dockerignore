@@ -1,0 +1,9 @@
+.git
+node_modules
+data
+test
+tools
+*.log
+agent.json
+pairing.txt
+.agent-env

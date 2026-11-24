@@ -1,6 +1,6 @@
 const express = require('express');
 const net = require('net');
-const cors = require('cors');
+const crypto = require('crypto');
 const { exec, spawn } = require('child_process');
 const fsSync = require('fs');
 const fs = fsSync.promises;
@@ -8,7 +8,6 @@ const path = require('path');
 const YAML = require('yaml');
 const archiver = require('archiver');
 const { WebSocketServer } = require('ws');
-let jwt; try { jwt = require('jsonwebtoken'); } catch { jwt = null; }
 let pty;
 try { pty = require('@homebridge/node-pty-prebuilt-multiarch'); } catch { pty = null; }
 
@@ -100,12 +99,50 @@ function loadRuntimeConfig() {
 // used when TERMINAL_USE_SSH=true AND TERMINAL_SSH_HOST is explicitly set.
 const TERMINAL_SSH_HOST = process.env.TERMINAL_SSH_HOST || '';
 
-app.use(cors());
-app.use(express.json({ limit: '100mb' }));
+// Replaced by transfer-agent.js once it registers (see bottom of file).
+let transferHooks = { isLocked: () => false };
 
-if (process.env.NODE_ENV === 'production') {
-  app.use(express.static(path.join(__dirname, 'public')));
+// ─── Local API authentication ────────────────────────────────────────────────
+// This API runs as root on 127.0.0.1. Loopback is NOT a trust boundary: any
+// local user, any container with host networking, and any web page opened in a
+// browser on this machine (no-cors POSTs, DNS rebinding) can reach it. Every
+// request must carry the per-boot secret that tunnel.js generates and passes
+// to this process through its environment, so only the tunnel can drive it.
+const LOCAL_TOKEN = process.env.AGENT_LOCAL_TOKEN || '';
+const ALLOW_UNAUTHENTICATED_LOCAL = process.env.AGENT_ALLOW_UNAUTHENTICATED_LOCAL === 'true';
+if (!LOCAL_TOKEN && !ALLOW_UNAUTHENTICATED_LOCAL) {
+  console.error('[agent] AGENT_LOCAL_TOKEN is not set; refusing to start the local API without authentication.');
+  console.error('[agent] Start the agent via tunnel.js (the systemd unit does this). For isolated local development only, set AGENT_ALLOW_UNAUTHENTICATED_LOCAL=true.');
+  process.exit(1);
 }
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+function isLoopbackHostHeader(host) {
+  return LOOPBACK_HOSTS.has(String(host || '').toLowerCase().replace(/:\d+$/, ''));
+}
+
+function hasLocalToken(headers) {
+  if (!LOCAL_TOKEN) return ALLOW_UNAUTHENTICATED_LOCAL;
+  const got = Buffer.from(String(headers['x-agent-local-token'] || ''));
+  const want = Buffer.from(LOCAL_TOKEN);
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+
+// Shared by HTTP and the terminal WebSocket upgrade.
+function localRequestRejection(headers) {
+  if (!isLoopbackHostHeader(headers.host)) return [421, 'Misdirected request.']; // DNS rebinding
+  if (headers.origin) return [403, 'Browser requests are not accepted.'];       // the tunnel never sends Origin
+  if (!hasLocalToken(headers)) return [401, 'Unauthorized.'];
+  return null;
+}
+
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  const rejection = localRequestRejection(req.headers);
+  if (rejection) return res.status(rejection[0]).json({ success: false, error: rejection[1] });
+  next();
+});
+app.use(express.json({ limit: process.env.AGENT_BODY_LIMIT || '50mb' }));
 
 function execCmd(cmd, timeout = 60000) {
   return new Promise((resolve, reject) => {
@@ -147,6 +184,11 @@ function streamCommand(res, cmd, label, timeout = 120000) {
   child.on('close', code => finish(code ?? 0));
   res.on('close', () => { clearTimeout(timer); }); // client gone — let the command finish on its own
 }
+
+// Every docker invocation goes through this command prefix so it can be
+// pointed at another binary. The automated tests point it at a fake so a test
+// run can never touch a real Docker daemon. Raw shell prefix; default `docker`.
+const DOCKER = process.env.AGENT_DOCKER_BIN || 'docker';
 
 function formatBytes(bytes) {
   if (!bytes || bytes === 0) return '0 B';
@@ -220,7 +262,14 @@ async function getSystemUptime() {
 
 // Find a usable SSH private key. Skips paths that exist but are not regular
 // files (e.g. a directory created from a bad volume mount → EISDIR).
+let _sshKeyCache = { key: null, ts: 0 };
 function findSshKey() {
+  if (Date.now() - _sshKeyCache.ts < 60_000) return _sshKeyCache.key;
+  _sshKeyCache = { key: findSshKeyUncached(), ts: Date.now() };
+  return _sshKeyCache.key;
+}
+
+function findSshKeyUncached() {
   const homeDir = process.env.HOME || '/root';
   const candidates = [
     process.env.TERMINAL_SSH_KEY_PATH,
@@ -274,6 +323,69 @@ async function resolveSshHost() {
   );
 }
 
+// ─── SSH host identity verification ─────────────────────────────────────────
+// Connecting without checking the host key lets anyone on the network path
+// impersonate the target and capture every command (and the key's access).
+// The host key must match TERMINAL_SSH_HOST_FINGERPRINT ("SHA256:…", as
+// printed by `ssh-keygen -lf`) or an entry in TERMINAL_SSH_KNOWN_HOSTS
+// (default ~/.ssh/known_hosts). With neither, the connection is refused.
+function sshFingerprint(keyBuf) {
+  return 'SHA256:' + crypto.createHash('sha256').update(keyBuf).digest('base64').replace(/=+$/, '');
+}
+
+function knownHostsMatch(file, host, port, keyBuf) {
+  let text;
+  try { text = fsSync.readFileSync(file, 'utf-8'); } catch { return false; }
+  const target = port === 22 ? host : `[${host}]:${port}`;
+  const hostMatches = pattern => {
+    if (pattern.startsWith('|1|')) {
+      const [, , salt, hash] = pattern.split('|');
+      if (!salt || !hash) return false;
+      const h = crypto.createHmac('sha1', Buffer.from(salt, 'base64')).update(target).digest('base64');
+      return h === hash;
+    }
+    return pattern.toLowerCase() === target.toLowerCase();
+  };
+  let matched = false;
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const parts = line.split(/\s+/);
+    let marker = null;
+    if (parts[0].startsWith('@')) marker = parts.shift();
+    if (parts.length < 3 || marker === '@cert-authority') continue;
+    if (!parts[0].split(',').some(hostMatches)) continue;
+    let blob;
+    try { blob = Buffer.from(parts[2], 'base64'); } catch { continue; }
+    if (!blob.equals(keyBuf)) continue;
+    if (marker === '@revoked') return false;
+    matched = true;
+  }
+  return matched;
+}
+
+function makeSshHostVerifier(host, port) {
+  const pinned = (process.env.TERMINAL_SSH_HOST_FINGERPRINT || '').trim().replace(/=+$/, '');
+  const knownHosts = process.env.TERMINAL_SSH_KNOWN_HOSTS
+    || path.join(process.env.HOME || '/root', '.ssh', 'known_hosts');
+  return keyBuf => {
+    if (!Buffer.isBuffer(keyBuf)) return false;
+    if (pinned) {
+      const got = Buffer.from(sshFingerprint(keyBuf));
+      const want = Buffer.from(pinned);
+      return got.length === want.length && crypto.timingSafeEqual(got, want);
+    }
+    const ok = knownHostsMatch(knownHosts, host, port, keyBuf);
+    if (!ok) console.error(`[agent] SSH host key for ${host}:${port} (${sshFingerprint(keyBuf)}) is not trusted; set TERMINAL_SSH_HOST_FINGERPRINT or add it to ${knownHosts}.`);
+    return ok;
+  };
+}
+
+// SSH is only attempted when the operator configured a target and a key.
+function sshConfigured() {
+  return Boolean(TERMINAL_SSH_HOST) && Boolean(findSshKey());
+}
+
 // Run a command on the real server via SSH (used when backend is in a container)
 async function sshExec(command, timeoutMs = 15000) {
   const privateKey = findSshKey();
@@ -298,19 +410,20 @@ async function sshExec(command, timeoutMs = 15000) {
       });
     });
     conn.on('error', e => { clearTimeout(timer); reject(e); });
-    conn.connect({ host: sshHost, port: sshPort, username: sshUser, privateKey });
+    conn.connect({ host: sshHost, port: sshPort, username: sshUser, privateKey, hostVerifier: makeSshHostVerifier(sshHost, sshPort), readyTimeout: 10000 });
   });
 }
 
-// Run a host-level command: prefer SSH to the host (full host view, real
-// coreutils); fall back to running locally inside the container.
+// Run a host-level command: SSH to the host when SSH is configured (full host
+// view from a container); otherwise, or if SSH fails, run locally.
 async function hostExec(cmd, timeoutMs = 10000) {
-  try {
-    const out = await sshExec(cmd, timeoutMs);
-    return { stdout: String(out) };
-  } catch {
-    return execCmd(cmd, timeoutMs);
+  if (sshConfigured()) {
+    try {
+      const out = await sshExec(cmd, timeoutMs);
+      return { stdout: String(out) };
+    } catch {}
   }
+  return execCmd(cmd, timeoutMs);
 }
 
 // The dashboard container runs on the server with pid:host, so local ps sees
@@ -319,7 +432,8 @@ async function readLinuxProcesses(limit = 150) {
   let stdout;
   try {
     ({ stdout } = await execCmd(`ps aux --sort=-%cpu`, 15000));
-  } catch {
+  } catch (err) {
+    if (!sshConfigured()) throw err;
     stdout = await sshExec(`ps aux --sort=-%cpu`);
   }
   const lines = (stdout || '').trim().split('\n');
@@ -370,12 +484,23 @@ async function getServerIps() {
   return Array.from(ips);
 }
 
+// Service / compose names. The old pattern accepted "." and "..", so a name of
+// ".." resolved services/<name> to the server root, and a leading "-" could be
+// read as a command-line option by docker.
 function isSafeName(name) {
-  return /^[a-zA-Z0-9_.-]+$/.test(name || '');
+  return typeof name === 'string'
+    && /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/.test(name)
+    && !name.includes('..');
 }
 
+// Quote one argument for the platform shell used by exec()/spawn({shell}).
+// POSIX: single quotes (nothing is special inside them). Windows cmd.exe has
+// no single-quote syntax, so double quotes with "" escaping are used there.
 function shQuote(value) {
-  return `"${String(value).replace(/(["\\$`])/g, '\\$1')}"`;
+  const s = String(value);
+  if (/[\0\r\n]/.test(s)) throw new Error('Invalid character in command argument.');
+  if (process.platform === 'win32') return `"${s.replace(/"/g, '""')}"`;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 async function readTextIfExists(file, fallback = '') {
@@ -387,9 +512,23 @@ async function readTextIfExists(file, fallback = '') {
   }
 }
 
+// Compose project name of the main compose file, used to tell this project's
+// containers apart from same-named services of other compose projects.
+let _composeProject = null;
+function normalizeProjectName(v) {
+  return String(v || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').replace(/^[^a-z0-9]+/, '') || null;
+}
+function composeProjectName(doc) {
+  return normalizeProjectName(doc && doc.name)
+    || normalizeProjectName(process.env.COMPOSE_PROJECT_NAME)
+    || normalizeProjectName(path.basename(path.dirname(MAIN_COMPOSE)));
+}
+
 async function readComposeDoc() {
   const content = await readTextIfExists(MAIN_COMPOSE, 'name: homeserver\n\nservices: {}\n');
-  return YAML.parse(content) || {};
+  const doc = YAML.parse(content) || {};
+  _composeProject = composeProjectName(doc);
+  return doc;
 }
 
 async function getMainComposeServices() {
@@ -595,7 +734,7 @@ async function appendCaddyBlock(block) {
 
 async function listDockerContainers() {
   try {
-    const { stdout } = await execCmd('docker ps -a --format "{{json .}}"');
+    const { stdout } = await execCmd(`${DOCKER} ps -a --no-trunc --format "{{json .}}"`);
     return stdout.trim().split('\n')
       .filter(l => l.trim())
       .map(l => { try { return JSON.parse(l); } catch { return null; } })
@@ -616,12 +755,12 @@ async function getDockerStatus() {
   if (_dockerStatusCache.value && now - _dockerStatusCache.ts < 5000) return _dockerStatusCache.value;
   let installed = false, running = false, error = null;
   try {
-    await execCmd('docker --version', 5000);
+    await execCmd(`${DOCKER} --version`, 5000);
     installed = true;
   } catch { /* docker binary not on PATH */ }
   if (installed) {
     try {
-      await execCmd('docker ps -q', 8000);
+      await execCmd(`${DOCKER} ps -q`, 8000);
       running = true;
     } catch (err) {
       const raw = (err.stderr || err.error || '').toString().trim();
@@ -660,16 +799,28 @@ function containerNames(c) {
 // like service "db" matching container "couchdb" or "web" matching "webhook",
 // which is why the dashboard sometimes showed a service as running/stopped
 // based on a completely unrelated container's state.
-function findContainerForService(containers, name) {
+//
+// All three are scoped to the main compose project: a container that belongs
+// to a DIFFERENT compose project (its project label differs) is never matched,
+// even when its service label or name is the same. Otherwise two projects that
+// both define "db" had their stats and states merged into one service.
+function findContainerForService(containers, name, project = _composeProject) {
   if (!name) return null;
   const lower = name.toLowerCase();
-  const composePattern = new RegExp(`(^|[-_])${escapeRegExp(lower)}([-_]\\d+)?$`);
+  const proj = project ? project.toLowerCase() : null;
+  const defaultName = proj
+    ? new RegExp(`^${escapeRegExp(proj)}[-_]${escapeRegExp(lower)}[-_]\\d+$`)
+    : null;
 
   const matches = containers.filter(c => {
-    if (labelsObject(c.Labels)['com.docker.compose.service'] === name) return true;
-    const names = containerNames(c);
-    if (names.some(n => n.toLowerCase() === lower)) return true;
-    if (names.some(n => composePattern.test(n.toLowerCase()))) return true;
+    const labels = labelsObject(c.Labels);
+    const cproj = String(labels['com.docker.compose.project'] || '').toLowerCase();
+    const sameProject = !proj || !cproj || cproj === proj;
+    if (!sameProject) return false;
+    if (labels['com.docker.compose.service'] === name) return true;
+    const names = containerNames(c).map(n => n.toLowerCase());
+    if (names.includes(lower)) return true;
+    if (defaultName && names.some(n => defaultName.test(n))) return true;
     return false;
   });
 
@@ -733,15 +884,39 @@ async function getServiceConfig(name) {
   };
 }
 
-function resolveServiceFilePath(serviceDir, requestedPath = '.') {
-  const relative = String(requestedPath || '.').replace(/\\/g, '/');
-  const target = path.resolve(serviceDir, relative);
-  const base = path.resolve(serviceDir);
-  const rel = path.relative(base, target);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error('Path is outside the service directory.');
+function isOutside(rel) {
+  return rel === '..' || rel.startsWith(`..${path.sep}`) || rel.startsWith('../') || path.isAbsolute(rel);
+}
+
+// Symlinks: lexical containment is not enough — services/x/link -> /etc would
+// pass it. The deepest EXISTING ancestor of the target must resolve (after
+// following symlinks) inside the real service directory.
+function assertRealPathInside(base, target) {
+  let realBase;
+  try { realBase = fsSync.realpathSync(base); } catch { return; } // base not created yet
+  let probe = target;
+  for (;;) {
+    let real = null;
+    try { real = fsSync.realpathSync(probe); } catch {}
+    if (real) {
+      if (isOutside(path.relative(realBase, real))) throw new Error('Path resolves outside the service directory.');
+      return;
+    }
+    const parent = path.dirname(probe);
+    if (parent === probe) return;
+    probe = parent;
   }
-  return { target, relative: rel || '.' };
+}
+
+function resolveServiceFilePath(serviceDir, requestedPath = '.') {
+  const relative = String(requestedPath ?? '.').replace(/\\/g, '/') || '.';
+  if (relative.includes('\0')) throw new Error('Invalid path.');
+  const base = path.resolve(serviceDir);
+  const target = path.resolve(base, relative);
+  const rel = path.relative(base, target);
+  if (isOutside(rel)) throw new Error('Path is outside the service directory.');
+  assertRealPathInside(base, target);
+  return { target, relative: rel.replace(/\\/g, '/') || '.' };
 }
 
 function isLikelyEditable(filePath, size) {
@@ -1044,13 +1219,18 @@ async function auditServiceDirectory(serviceDir, finalServices, serverRoot) {
   return warnings;
 }
 
+// Resolve the container for a service to its full, unambiguous ID — or null.
+// There is deliberately NO fallback to the bare service name: docker resolves
+// names AND id prefixes, so `docker stats cafe` would happily report some
+// other container whose id starts with "cafe".
 async function getContainerTarget(name) {
   const containers = await listDockerContainers();
-  const container = findContainerForService(containers, name);
-  // Prefer the container ID (always unambiguous). If we only have Names, pick
-  // the first one — Names can be a comma-separated list and passing the raw
-  // value to `docker stats|logs` would error out.
-  return container?.ID || containerNames(container)[0] || name;
+  const { composeServiceName, serviceDef } = await getServiceConfig(name);
+  for (const candidate of [composeServiceName, name, serviceDef?.container_name].filter(Boolean)) {
+    const container = findContainerForService(containers, candidate);
+    if (container?.ID) return container.ID;
+  }
+  return null;
 }
 
 // Env file: try compose env_file, .name-env, name.env, .name (matching the server's convention)
@@ -1106,7 +1286,7 @@ async function getComposeArgs(name) {
 }
 
 function buildCmd(action, file, service) {
-  const base = `docker compose -f ${shQuote(file)}`;
+  const base = `${DOCKER} compose -f ${shQuote(file)}`;
   const svcs = Array.isArray(service) ? service : (service ? [service] : []);
   const svcStr = svcs.length ? ' ' + svcs.map(shQuote).join(' ') : '';
   switch (action) {
@@ -1119,41 +1299,101 @@ function buildCmd(action, file, service) {
   }
 }
 
-async function getRelatedServiceNames(name) {
-  const mainServices = await getMainComposeServices();
-  const prefix = `${name}-`;
-  return Object.keys(mainServices).filter(s => s === name || s.startsWith(prefix));
+function pathInside(dir, p) {
+  if (!p) return false;
+  const r = path.relative(path.resolve(dir), path.resolve(p));
+  return r === '' || !isOutside(r);
 }
 
-// ─── Auth ────────────────────────────────────────────────────────────────────
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-const JWT_SECRET     = process.env.JWT_SECRET || process.env.ADMIN_PASSWORD; // fallback: use password as secret
-
-app.post('/api/auth/token', (req, res) => {
-  if (!ADMIN_PASSWORD) return res.json({ success: false, error: 'ADMIN_PASSWORD is not set on the server.' });
-  if (!jwt)            return res.json({ success: false, error: 'jsonwebtoken module not installed.' });
-  const { password } = req.body || {};
-  if (!password || password !== ADMIN_PASSWORD)
-    return res.status(401).json({ success: false, error: 'Incorrect password.' });
-  const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '5m' });
-  res.json({ success: true, token });
-});
-
-function requireAuth(req, res, next) {
-  if (!jwt)        return res.status(500).json({ success: false, error: 'Auth module not installed.' });
-  if (!JWT_SECRET) return res.status(500).json({ success: false, error: 'JWT_SECRET not configured.' });
-  const auth = req.headers.authorization || '';
-  if (!auth.startsWith('Bearer '))
-    return res.status(401).json({ success: false, error: 'Authentication required.' });
-  try {
-    req.auth = jwt.verify(auth.slice(7), JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ success: false, error: 'Invalid or expired token. Re-enter your password.' });
+function bindSource(volume) {
+  if (typeof volume === 'string') {
+    const src = volume.split(':')[0];
+    return src && (src.startsWith('.') || src.startsWith('/') || src.startsWith('~')) ? src : null;
   }
+  if (volume && typeof volume === 'object' && volume.type === 'bind' && volume.source) return volume.source;
+  return null;
+}
+
+// Compose services that make up the service whose directory is services/<name>:
+//   • the service called <name>;
+//   • services BUILT from a context inside services/<name>;
+//   • "<name>-*" services that bind-mount something inside services/<name>
+//     (the static-site siblings the dashboard generates).
+// The previous rule — every service whose name merely starts with "<name>-" —
+// meant actions on "web" also stopped an unrelated "web-proxy", and deleting
+// "web" removed it from the compose file. Shared services such as caddy that
+// mount many service folders are deliberately NOT related to those folders.
+async function getRelatedServiceNames(name, services = null) {
+  const mainServices = services || await getMainComposeServices();
+  const dir = path.join(SERVICES_DIR, name);
+  return Object.entries(mainServices).filter(([svc, def]) => {
+    if (svc === name) return true;
+    if (!def || typeof def !== 'object') return false;
+    const build = typeof def.build === 'string' ? def.build : def.build?.context;
+    if (build && pathInside(dir, resolveServerPath(build))) return true;
+    if (svc.startsWith(`${name}-`)) {
+      const vols = Array.isArray(def.volumes) ? def.volumes : [];
+      if (vols.some(v => { const s = bindSource(v); return s && pathInside(dir, resolveServerPath(s)); })) return true;
+    }
+    return false;
+  }).map(([svc]) => svc);
+}
+
+// Remove one service block from the main compose file. Returns true if found.
+async function removeMainComposeService(composeName) {
+  const content = await readTextIfExists(MAIN_COMPOSE);
+  const lines = content.replace(/\r\n/g, '\n').split('\n');
+  const range = getTopLevelBlockRange(lines, 'services');
+  if (!range) return false;
+  const svcStart = lines.findIndex((l, i) =>
+    i > range.start && i < range.end &&
+    new RegExp(`^  ${escapeRegex(composeName)}:\\s*(#.*)?$`).test(l)
+  );
+  if (svcStart === -1) return false;
+  let svcEnd = range.end;
+  for (let i = svcStart + 1; i < range.end; i++) {
+    if (/^  [A-Za-z0-9_.-]+:\s*(#.*)?$/.test(lines[i])) { svcEnd = i; break; }
+  }
+  lines.splice(svcStart, svcEnd - svcStart);
+  const next = lines.join('\n').replace(/\n{3,}/g, '\n\n');
+  await fs.writeFile(MAIN_COMPOSE, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+  return true;
+}
+
+// Env files referenced by any service in `services` (absolute paths).
+function envFilesReferenced(services) {
+  const out = new Set();
+  for (const def of Object.values(services || {})) {
+    if (!def || typeof def !== 'object' || !def.env_file) continue;
+    for (const f of [].concat(def.env_file)) {
+      const p = typeof f === 'string' ? f : f?.path;
+      if (p) out.add(path.resolve(resolveServerPath(p)));
+    }
+  }
+  return out;
 }
 
 // ─── Services ───────────────────────────────────────────────────────────────
+
+// Central validation for every route with a :name parameter. Several routes
+// (env GET/PUT, caddy, files) previously used the raw name in filesystem
+// paths without validating it, so a double-encoded "..%2F" in the URL read or
+// overwrote arbitrary files as root.
+app.param('name', (req, res, next, name) => {
+  if (!isSafeName(name)) return res.status(400).json({ success: false, error: 'Invalid service name.' });
+  next();
+});
+
+// While a service is being transferred its files, env and compose entry are
+// frozen and it must not be started: a write would corrupt the bundle being
+// exported, and a start would run two instances against the same data.
+app.use('/api/services/:name', (req, res, next) => {
+  if (req.method === 'GET' || !isSafeName(req.params.name)) return next();
+  if (transferHooks.isLocked(req.params.name)) {
+    return res.status(409).json({ success: false, error: `"${req.params.name}" is locked by a service transfer in progress.` });
+  }
+  next();
+});
 
 // GET /api/services — merges docker-compose services + services directory, tagged with source pills
 app.get('/api/services', async (req, res) => {
@@ -1175,7 +1415,7 @@ app.get('/api/services', async (req, res) => {
     let   dirNames     = new Set();
     try {
       const entries = await fs.readdir(SERVICES_DIR, { withFileTypes: true });
-      dirNames = new Set(entries.filter(e => e.isDirectory()).map(e => e.name));
+      dirNames = new Set(entries.filter(e => e.isDirectory() && isSafeName(e.name)).map(e => e.name));
     } catch {}
 
     const allNames = [...new Set([...composeNames, ...dirNames])].sort((a, b) => a.localeCompare(b));
@@ -1277,6 +1517,7 @@ app.get('/api/services/diagnose', async (req, res) => {
     res.json({
       serverRoot: SERVER_ROOT,
       composeFile: MAIN_COMPOSE,
+      composeProject: _composeProject,
       docker,
       containerCount: containers.length,
       containers: containers.map(c => ({
@@ -1290,20 +1531,25 @@ app.get('/api/services/diagnose', async (req, res) => {
       services,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    // No stack traces in responses (they disclose paths and internals).
+    console.error('[agent] diagnose failed:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/services/:name/stats
+// GET /api/services/:name/stats — stats for THIS service's container only.
 app.get('/api/services/:name/stats', async (req, res) => {
   const { name } = req.params;
   try {
-    if (!isSafeName(name)) throw new Error('Invalid service name.');
     const target = await getContainerTarget(name);
-    const { stdout } = await execCmd(`docker stats --no-stream --format "{{json .}}" ${shQuote(target)}`, 10000);
-    res.json({ success: true, stats: JSON.parse(stdout.trim().split('\n')[0]) });
+    if (!target) return res.json({ success: false, code: 'not_deployed', service: name, error: 'This service has no deployed container.' });
+    const { stdout } = await execCmd(`${DOCKER} stats --no-stream --format "{{json .}}" ${shQuote(target)}`, 10000);
+    const stats = JSON.parse(stdout.trim().split('\n')[0]);
+    // Echo the identity so the client can discard a response that arrives
+    // after it has already switched to another service.
+    res.json({ success: true, service: name, containerId: target, stats });
   } catch (err) {
-    res.json({ success: false, error: err.error || err.message });
+    res.json({ success: false, service: name, error: err.error || err.message });
   }
 });
 
@@ -1312,7 +1558,6 @@ app.get('/api/services/:name/logs', async (req, res) => {
   const { name } = req.params;
   const tail = parseInt(req.query.tail) || 200;
   try {
-    if (!isSafeName(name)) throw new Error('Invalid service name.');
     const docker = await getDockerStatus();
     if (!docker.running) {
       throw new Error(docker.installed
@@ -1320,9 +1565,10 @@ app.get('/api/services/:name/logs', async (req, res) => {
         : "Docker isn't installed on this host.");
     }
     const target = await getContainerTarget(name);
+    if (!target) return res.json({ success: true, service: name, output: '', note: 'This service has no deployed container.' });
     const safeTail = Math.min(Math.max(tail, 1), 5000);
-    const { stdout, stderr } = await execCmd(`docker logs --tail ${safeTail} --timestamps ${shQuote(target)} 2>&1`, 15000);
-    res.json({ success: true, output: stdout || stderr });
+    const { stdout, stderr } = await execCmd(`${DOCKER} logs --tail ${safeTail} --timestamps ${shQuote(target)} 2>&1`, 15000);
+    res.json({ success: true, service: name, output: stdout || stderr });
   } catch (err) {
     res.json({ success: false, error: err.error || err.message, output: err.stderr || '' });
   }
@@ -1346,9 +1592,12 @@ app.put('/api/services/:name/env', async (req, res) => {
   const { name } = req.params;
   const { content } = req.body;
   try {
-    await fs.mkdir(ENVS_DIR, { recursive: true });
+    if (typeof content !== 'string') throw new Error('Env content must be text.');
+    await fs.mkdir(ENVS_DIR, { recursive: true, mode: 0o700 });
     const envPath = await findEnvPath(name);
-    await fs.writeFile(envPath, content, 'utf-8');
+    // Env files hold secrets: new files are created owner-only (existing
+    // files keep whatever mode the operator gave them).
+    await fs.writeFile(envPath, content, { encoding: 'utf-8', mode: 0o600 });
     res.json({ success: true, output: `Saved to ${envPath}` });
   } catch (err) {
     res.json({ success: false, error: err.message });
@@ -1467,7 +1716,8 @@ app.get('/api/services/:name/files', async (req, res) => {
     const entries = await fs.readdir(target, { withFileTypes: true });
     const files = await Promise.all(entries.map(async entry => {
       const entryPath = path.join(target, entry.name);
-      const entryStat = await fs.stat(entryPath);
+      // A dangling symlink used to make the whole listing fail.
+      const entryStat = await fs.stat(entryPath).catch(() => fs.lstat(entryPath));
       const relPath = path.relative(serviceDir, entryPath).replace(/\\/g, '/');
       return {
         name: entry.name,
@@ -1528,7 +1778,8 @@ app.delete('/api/services/:name/file', async (req, res) => {
   try {
     const { serviceDir } = await getServiceConfig(name);
     const { target, relative } = resolveServiceFilePath(serviceDir, req.query.path);
-    const stat = await fs.stat(target);
+    if (relative === '.') throw new Error('Refusing to delete the service root here; use Delete Service instead.');
+    const stat = await fs.lstat(target);
     if (stat.isDirectory()) {
       await fs.rm(target, { recursive: true, force: true });
     } else {
@@ -1728,83 +1979,74 @@ async function serviceAction(req, res, action, timeout = 120000) {
   }
 }
 
-app.delete('/api/services/:name', requireAuth, async (req, res) => {
+// DELETE /api/services/:name — irreversible. The hub only forwards this after
+// a fresh step-up re-authentication of the dashboard user (the agent's old
+// ADMIN_PASSWORD token flow could never be satisfied through the hub).
+app.delete('/api/services/:name', async (req, res) => {
   const { name } = req.params;
   const deleteFiles = req.query.deleteFiles === 'true';
-  if (!isSafeName(name)) return res.json({ success: false, error: 'Invalid service name.' });
-
   const msgs = [];
-
-  // Collect the service and all {name}-* siblings
-  const relatedNames = await getRelatedServiceNames(name);
-
-  // 1. Stop + remove containers for all related services
-  for (const svcName of relatedNames) {
-    try {
-      const { file, service } = await getComposeArgs(svcName);
-      const cmd = `docker compose -f ${shQuote(file)} rm -sf${service ? ` ${shQuote(service)}` : ''}`;
-      const { stdout, stderr } = await execCmd(cmd, 60000);
-      msgs.push(`Stopped/removed "${svcName}": ${(stdout + stderr).trim() || 'ok'}`);
-    } catch (e) { msgs.push(`Warn (container ${svcName}): ${e.error || e.message}`); }
-  }
-
-  // 2. Remove all related services from docker-compose.yml
-  for (const svcName of relatedNames) {
-    try {
-      const mainServices = await getMainComposeServices();
-      const composeService = getComposeServiceForDirectory(svcName, mainServices);
-      if (composeService) {
-        const content = await readTextIfExists(MAIN_COMPOSE);
-        const lines = content.replace(/\r\n/g, '\n').split('\n');
-        const range = getTopLevelBlockRange(lines, 'services');
-        if (range) {
-          const svcStart = lines.findIndex((l, i) =>
-            i > range.start && i < range.end &&
-            new RegExp(`^  ${escapeRegex(composeService.name)}:\\s*(#.*)?$`).test(l)
-          );
-          if (svcStart !== -1) {
-            let svcEnd = range.end;
-            for (let i = svcStart + 1; i < range.end; i++) {
-              if (/^  [A-Za-z0-9_.-]+:\s*(#.*)?$/.test(lines[i])) { svcEnd = i; break; }
-            }
-            lines.splice(svcStart, svcEnd - svcStart);
-            const next = lines.join('\n').replace(/\n{3,}/g, '\n\n');
-            await fs.writeFile(MAIN_COMPOSE, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
-            msgs.push(`Removed "${composeService.name}" from docker-compose.yml`);
-          }
-        }
-      }
-    } catch (e) { msgs.push(`Warn (compose ${svcName}): ${e.message}`); }
-  }
-
-  // 3. Remove Caddy blocks
   try {
-    const { content, matches } = await getCaddyBlocksForService(name);
-    if (matches.length > 0) {
-      const first = matches[0], last = matches[matches.length - 1];
-      const next = (content.slice(0, first.start).trimEnd() + '\n\n' + content.slice(last.end).trimStart()).trimEnd() + '\n';
-      await fs.writeFile(CADDYFILE, next, 'utf-8');
-      msgs.push(`Removed Caddy block(s) for "${name}"`);
+    if (transferHooks.isLocked(name)) {
+      return res.status(409).json({ success: false, error: `"${name}" is locked by a service transfer in progress.` });
     }
-  } catch (e) { msgs.push(`Warn (caddy): ${e.message}`); }
-
-  // 4. Delete env file
-  try {
+    // The env file(s) this service uses, resolved BEFORE compose is edited.
     const envPath = await findEnvPath(name);
-    await fs.unlink(envPath);
-    msgs.push(`Deleted ${envPath}`);
-  } catch (e) { if (e.code !== 'ENOENT') msgs.push(`Warn (env): ${e.message}`); }
+    const servicesBefore = await getMainComposeServices();
+    const relatedNames = await getRelatedServiceNames(name, servicesBefore);
 
-  // 5. Optionally delete service directory
-  if (deleteFiles) {
+    // 1. Stop + remove containers for all related services
+    for (const svcName of relatedNames) {
+      try {
+        const cmd = `${DOCKER} compose -f ${shQuote(MAIN_COMPOSE)} rm -sf ${shQuote(svcName)}`;
+        const { stdout, stderr } = await execCmd(cmd, 60000);
+        msgs.push(`Stopped/removed "${svcName}": ${(stdout + stderr).trim() || 'ok'}`);
+      } catch (e) { msgs.push(`Warn (container ${svcName}): ${e.error || e.message}`); }
+    }
+
+    // 2. Remove all related services from the main compose file
+    for (const svcName of relatedNames) {
+      try {
+        if (await removeMainComposeService(svcName)) msgs.push(`Removed "${svcName}" from ${path.basename(MAIN_COMPOSE)}`);
+      } catch (e) { msgs.push(`Warn (compose ${svcName}): ${e.message}`); }
+    }
+
+    // 3. Remove Caddy blocks
     try {
-      const serviceDir = path.join(SERVICES_DIR, name);
-      await fs.rm(serviceDir, { recursive: true, force: true });
-      msgs.push(`Deleted ${serviceDir}`);
-    } catch (e) { msgs.push(`Warn (files): ${e.message}`); }
-  }
+      const { content, matches } = await getCaddyBlocksForService(name);
+      if (matches.length > 0) {
+        const first = matches[0], last = matches[matches.length - 1];
+        const next = (content.slice(0, first.start).trimEnd() + '\n\n' + content.slice(last.end).trimStart()).trimEnd() + '\n';
+        await fs.writeFile(CADDYFILE, next, 'utf-8');
+        msgs.push(`Removed Caddy block(s) for "${name}"`);
+      }
+    } catch (e) { msgs.push(`Warn (caddy): ${e.message}`); }
 
-  res.json({ success: true, output: msgs.join('\n') });
+    // 4. Delete the env file — unless a remaining service still uses it
+    // (e.g. an app and its database sharing one env file).
+    try {
+      const stillUsed = envFilesReferenced(await getMainComposeServices()).has(path.resolve(envPath));
+      if (stillUsed) {
+        msgs.push(`Kept ${envPath} (still used by another service)`);
+      } else {
+        await fs.unlink(envPath);
+        msgs.push(`Deleted ${envPath}`);
+      }
+    } catch (e) { if (e.code !== 'ENOENT') msgs.push(`Warn (env): ${e.message}`); }
+
+    // 5. Optionally delete service directory
+    if (deleteFiles) {
+      try {
+        const serviceDir = path.join(SERVICES_DIR, name);
+        await fs.rm(serviceDir, { recursive: true, force: true });
+        msgs.push(`Deleted ${serviceDir}`);
+      } catch (e) { msgs.push(`Warn (files): ${e.message}`); }
+    }
+
+    res.json({ success: true, output: msgs.join('\n') });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, output: msgs.join('\n') });
+  }
 });
 
 app.post('/api/services/:name/start',   (req, res) => serviceAction(req, res, 'start'));
@@ -1838,7 +2080,7 @@ app.put('/api/caddy', async (req, res) => {
 app.post('/api/caddy/reload', async (req, res) => {
   try {
     const { stdout, stderr } = await execCmd(
-      'docker exec caddy caddy reload --config /etc/caddy/Caddyfile', 15000
+      `${DOCKER} exec caddy caddy reload --config /etc/caddy/Caddyfile`, 15000
     );
     res.json({ success: true, output: stdout + stderr || 'Caddy reloaded.' });
   } catch (err) {
@@ -2038,16 +2280,16 @@ app.get('/api/system/detailed', async (req, res) => {
     hostExec('cat /proc/loadavg'),
     hostExec('hostname -I'),
     hostExec('ps aux --sort=-%cpu | head -11 | tail -n +2'),
-    execCmd('docker ps -a --format "{{json .}}"'),
-    execCmd('docker images --format "{{json .}}"'),
+    execCmd(`${DOCKER} ps -a --format "{{json .}}"`),
+    execCmd(`${DOCKER} images --format "{{json .}}"`),
     hostExec('uptime -p'),
     hostExec('hostname'),
     hostExec("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2"),
     hostExec('uname -m'),
-    execCmd('docker version --format "{{json .}}"'),
-    execCmd('docker compose version --short'),
-    execCmd('docker network ls --format "{{json .}}"'),
-    execCmd('docker volume ls --format "{{json .}}"'),
+    execCmd(`${DOCKER} version --format "{{json .}}"`),
+    execCmd(`${DOCKER} compose version --short`),
+    execCmd(`${DOCKER} network ls --format "{{json .}}"`),
+    execCmd(`${DOCKER} volume ls --format "{{json .}}"`),
   ]);
 
   function val(i) { return results[i].status === 'fulfilled' ? results[i].value.stdout.trim() : ''; }
@@ -2211,7 +2453,7 @@ async function sampleLiveStatsLocal(includeDisks = true) {
   // Skipped for background history sampling (no SSH round-trip every tick).
   let dfOut = '';
   if (includeDisks) {
-    try { dfOut = await sshExec('df -P -k', 8000); } catch {}
+    if (sshConfigured()) { try { dfOut = await sshExec('df -P -k', 8000); } catch {} }
     if (!dfOut.trim()) {
       try { ({ stdout: dfOut } = await execCmd('df -P -k', 10000)); } catch {}
     }
@@ -2229,12 +2471,30 @@ async function sampleLiveStatsLocal(includeDisks = true) {
   return { cpu, mem, net, disks };
 }
 
+// Coalesce concurrent callers and reuse a result for `ttlMs`. Several open
+// dashboard tabs (or users) polling every few seconds used to each spawn their
+// own `docker stats` / two-sample CPU read.
+function singleFlight(fn, ttlMs) {
+  let pending = null;
+  let cached = null;
+  return () => {
+    if (cached && Date.now() - cached.at < ttlMs) return Promise.resolve(cached.value);
+    if (pending) return pending;
+    pending = Promise.resolve().then(fn).then(value => {
+      cached = { value, at: Date.now() };
+      return value;
+    }).finally(() => { pending = null; });
+    return pending;
+  };
+}
+const liveStatsShared = singleFlight(() => sampleLiveStatsLocal(), 1500);
+
 // btop-style live stats: two-sample CPU (accurate %), per-core, memory breakdown, net I/O rates.
 // Reads /proc locally first; falls back to SSH (python sampler on the host) only if local reads fail.
 app.get('/api/system/live', async (req, res) => {
   let localErr;
   try {
-    const data = await sampleLiveStatsLocal();
+    const data = await liveStatsShared();
     return res.json({ success: true, source: 'local', ...data });
   } catch (err) {
     localErr = err;
@@ -2305,6 +2565,7 @@ print(json.dumps({
 `.trim();
 
   try {
+    if (!sshConfigured()) throw new Error('SSH is not configured');
     const b64 = Buffer.from(pyScript).toString('base64');
     const output = await sshExec(`python3 -c "import base64,sys; exec(base64.b64decode('${b64}').decode())"`, 6000);
     const data = JSON.parse(output.trim());
@@ -2317,6 +2578,11 @@ print(json.dumps({
 // ── Background stats collection ──────────────────────────────────────────────
 // Sampled continuously from server start, independent of any open browser —
 // page reloads never restart stat collection. ~300 points @5s ≈ 25 minutes.
+const containerStatsShared = singleFlight(async () => {
+  const { stdout } = await execCmd(`${DOCKER} stats --no-stream --format "{{json .}}"`, 20000);
+  return stdout;
+}, 2500);
+
 const STATS_SAMPLE_MS  = parseInt(process.env.STATS_SAMPLE_MS) || 5000;
 const STATS_HISTORY_MAX = 300;
 const statsHistory = [];
@@ -2328,8 +2594,9 @@ async function collectStatsSample() {
   try {
     const live = await sampleLiveStatsLocal(false); // no disk lookup per tick
     let containers = [];
-    try {
-      const { stdout } = await execCmd('docker stats --no-stream --format "{{json .}}"', 15000);
+    // Don't spawn a failing `docker stats` every tick when there is no daemon.
+    if ((await getDockerStatus()).running) try {
+      const stdout = await containerStatsShared();
       containers = stdout.trim().split('\n').filter(l => l.trim()).map(l => {
         try {
           const s = JSON.parse(l);
@@ -2352,7 +2619,7 @@ app.get('/api/system/history', (req, res) => {
 
 app.get('/api/system/container-stats', async (req, res) => {
   try {
-    const { stdout } = await execCmd('docker stats --no-stream --format "{{json .}}"', 20000);
+    const stdout = await containerStatsShared();
     const stats = stdout.trim().split('\n').filter(l => l.trim()).map(l => {
       try {
         const s = JSON.parse(l);
@@ -2390,11 +2657,12 @@ app.post('/api/system/containers/:id/:action', async (req, res) => {
   const id = String(req.params.id || '');
   const action = String(req.params.action || '');
   const allowed = new Set(['start', 'stop', 'restart', 'kill']);
-  if (!/^[a-zA-Z0-9_.-]+$/.test(id)) return res.json({ success: false, error: 'Invalid container id.' });
+  // Must not start with "-" (would be parsed as a docker option).
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(id)) return res.json({ success: false, error: 'Invalid container id.' });
   if (!allowed.has(action)) return res.json({ success: false, error: 'Invalid container action.' });
 
   try {
-    const { stdout, stderr } = await execCmd(`docker ${action} ${shQuote(id)}`, 120000);
+    const { stdout, stderr } = await execCmd(`${DOCKER} ${action} ${shQuote(id)}`, 120000);
     res.json({ success: true, output: stdout + stderr || `${action} sent to ${id}.` });
   } catch (err) {
     res.json({ success: false, error: err.error || err.message, output: err.stderr || '' });
@@ -2455,35 +2723,59 @@ app.post('/api/system/processes/:pid/signal', async (req, res) => {
 });
 
 app.post('/api/system/prune', (req, res) => {
-  streamCommand(res, 'docker system prune -f', 'prune', 120000);
+  streamCommand(res, `${DOCKER} system prune -f`, 'prune', 120000);
 });
+
+// Whole-stack actions would also start/stop a service that is mid-transfer.
+function refuseIfAnyTransferLocked(res) {
+  if (!transferHooks.anyLocked || !transferHooks.anyLocked()) return false;
+  res.status(409).json({ success: false, error: 'A service transfer is in progress on this server; whole-stack actions are paused until it finishes.' });
+  return true;
+}
 
 app.post('/api/system/compose/:action', (req, res) => {
   const action = req.params.action;
   const commands = {
-    up: `docker compose -f ${shQuote(MAIN_COMPOSE)} up -d`,
-    stop: `docker compose -f ${shQuote(MAIN_COMPOSE)} stop`,
-    down: `docker compose -f ${shQuote(MAIN_COMPOSE)} down`,
+    up: `${DOCKER} compose -f ${shQuote(MAIN_COMPOSE)} up -d`,
+    stop: `${DOCKER} compose -f ${shQuote(MAIN_COMPOSE)} stop`,
+    down: `${DOCKER} compose -f ${shQuote(MAIN_COMPOSE)} down`,
   };
   if (!commands[action]) return res.json({ success: false, error: 'Unknown compose action.' });
+  if (refuseIfAnyTransferLocked(res)) return;
   streamCommand(res, commands[action], `compose ${action}`, 300000);
 });
 
 app.post('/api/system/pull-all', (req, res) => {
-  streamCommand(res, `docker compose -f ${shQuote(MAIN_COMPOSE)} pull 2>&1`, 'pull-all', 300000);
+  streamCommand(res, `${DOCKER} compose -f ${shQuote(MAIN_COMPOSE)} pull 2>&1`, 'pull-all', 300000);
 });
 
 app.post('/api/system/restart-all', (req, res) => {
-  streamCommand(res, `docker compose -f ${shQuote(MAIN_COMPOSE)} restart 2>&1`, 'restart-all', 300000);
+  if (refuseIfAnyTransferLocked(res)) return;
+  streamCommand(res, `${DOCKER} compose -f ${shQuote(MAIN_COMPOSE)} restart 2>&1`, 'restart-all', 300000);
 });
 
-if (process.env.NODE_ENV === 'production') {
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-  });
-}
+// ─── Service transfer engine (driven only by the hub) ────────────────────────
+transferHooks = require('./transfer-agent').register(app, {
+  get SERVER_ROOT() { return SERVER_ROOT; },
+  get SERVICES_DIR() { return SERVICES_DIR; },
+  get ENVS_DIR() { return ENVS_DIR; },
+  get MAIN_COMPOSE() { return MAIN_COMPOSE; },
+  get CADDYFILE() { return CADDYFILE; },
+  get composeProject() { return _composeProject; },
+  DOCKER, execCmd, shQuote, isSafeName, resolveServerPath, parseDfDisks, pathInside, bindSource,
+  readComposeDoc, getMainComposeServices, getRelatedServiceNames, envFilesReferenced,
+  appendComposeServices, removeMainComposeService, readTextIfExists,
+  getCaddyBlocksForService, parseCaddyBlocks, appendCaddyBlock,
+  listDockerContainers, findContainerForService, getContainerStatus, getDockerStatus,
+});
+
+// Unknown routes: JSON 404 (no SPA fallback — this API has no UI).
+app.use((req, res) => res.status(404).json({ success: false, error: 'Not found.' }));
 
 const server = app.listen(PORT, BIND_HOST, () => {
+  // Tells tunnel.js (and through its status file, the installer's health
+  // check) that the API actually came up, not merely that a process exists.
+  if (typeof process.send === 'function') { try { process.send({ type: 'ready' }); } catch {} }
   console.log(`Agent local API running on ${BIND_HOST}:${PORT}`);
   console.log(`Server root: ${SERVER_ROOT}  (main compose: ${MAIN_COMPOSE})`);
   if (!fsSync.existsSync(MAIN_COMPOSE)) {
@@ -2496,7 +2788,19 @@ const server = app.listen(PORT, BIND_HOST, () => {
 let sshLib;
 try { sshLib = require('ssh2'); } catch { sshLib = null; }
 
-const wss = new WebSocketServer({ server, path: '/ws/terminal', perMessageDeflate: false });
+// The terminal is a root shell: it gets the same local-token / Host / Origin
+// checks as the HTTP API (previously any local process could open one).
+const wss = new WebSocketServer({
+  server,
+  path: '/ws/terminal',
+  perMessageDeflate: false,
+  maxPayload: 1024 * 1024,
+  verifyClient: (info, done) => {
+    const rejection = localRequestRejection(info.req.headers);
+    if (rejection) return done(false, rejection[0], rejection[1]);
+    done(true);
+  },
+});
 
 wss.on('connection', (ws, req) => {
   const send = data => {
@@ -2605,7 +2909,7 @@ wss.on('connection', (ws, req) => {
 
     resolveSshHost().then(host => {
       chosenHost = host;
-      conn.connect({ host, port: sshPort, username: sshUser, privateKey, readyTimeout: 15000 });
+      conn.connect({ host, port: sshPort, username: sshUser, privateKey, readyTimeout: 15000, hostVerifier: makeSshHostVerifier(host, sshPort) });
     }).catch(err => {
       send(`SSH error: ${err.message}\r\n`);
       ws.close();

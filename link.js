@@ -18,11 +18,25 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
+const { checkHubUrl } = require('./tunnel');
+
 const HUB_URL  = process.env.HUB_URL || 'wss://dashboard.kyesworld.com/agent';
 const HUB_HTTP = HUB_URL.replace(/^ws/, 'http').replace(/\/agent\/?$/, '');
 const DATA_DIR = process.env.AGENT_DATA_DIR || path.join(__dirname, 'data');
 const CRED_FILE  = path.join(DATA_DIR, 'agent.json');
 const TOKEN_FILE = path.join(DATA_DIR, 'pairing.txt');
+
+// The dashboard password is sent to the hub, so the same rule as the tunnel
+// applies: TLS only (except loopback / private compose hostnames).
+const urlProblem = checkHubUrl(HUB_URL);
+if (urlProblem) { console.error(urlProblem); process.exit(2); }
+
+function writeToken(token) {
+  // Owner-only, atomic: the token links this host to the account.
+  const tmp = `${TOKEN_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, token + '\n', { mode: 0o600 });
+  fs.renameSync(tmp, TOKEN_FILE);
+}
 
 function ask(question, { hidden = false } = {}) {
   return new Promise(resolve => {
@@ -30,7 +44,9 @@ function ask(question, { hidden = false } = {}) {
     if (hidden) {
       rl._writeToOutput = s => { if (s.includes(question)) rl.output.write(s); /* hide typed chars */ };
     }
-    rl.question(question, answer => { rl.close(); if (hidden) process.stdout.write('\n'); resolve(answer.trim()); });
+    // Passwords are passed through verbatim (trimming them broke passwords
+    // that start or end with a space).
+    rl.question(question, answer => { rl.close(); if (hidden) process.stdout.write('\n'); resolve(hidden ? answer : answer.trim()); });
   });
 }
 
@@ -39,6 +55,7 @@ async function post(pathname, body) {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body || {}),
+    redirect: 'error', // never re-send credentials to wherever a redirect points
   });
   const data = await res.json().catch(() => ({}));
   return { res, data };
@@ -53,7 +70,7 @@ async function passwordFlow() {
   const { res, data } = await post('/api/pair/start', { email, password });
   if (!res.ok) { console.error(`\nLogin failed: ${data.error || res.statusText}`); process.exit(1); }
 
-  fs.writeFileSync(TOKEN_FILE, data.token + '\n', 'utf-8');
+  writeToken(data.token);
   console.log('\n' + '='.repeat(64));
   console.log(`  Token generated for ${data.email} (valid ${data.ttlMinutes} min).`);
   console.log('  In the dashboard (logged in as the SAME account):');
@@ -82,7 +99,7 @@ async function googleFlow() {
     await sleep(interval);
     const { data: poll } = await post('/api/pair/google/poll', { handle: data.handle });
     if (poll.status === 'approved') {
-      fs.writeFileSync(TOKEN_FILE, poll.token + '\n', 'utf-8');
+      writeToken(poll.token);
       console.log('\n' + '='.repeat(64));
       console.log(`  Signed in as ${poll.email || 'your Google account'}.`);
       console.log(`  Token generated (valid ${poll.ttlMinutes || 15} min).`);
@@ -100,7 +117,7 @@ async function googleFlow() {
 }
 
 (async () => {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
   // Count existing links (best-effort: tolerate legacy single-object format).
   let existing = 0;

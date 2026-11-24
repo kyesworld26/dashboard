@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake docker for installer tests (only what install-host.sh calls).
+case "$1" in --version) echo "Docker version 27.0.0-fake" ;; info) exit 0 ;; *) exit 0 ;; esac

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fake journalctl: print the sandboxed service log.
+R="${DASHBOARD_AGENT_TEST_ROOT:?}"; svc=""
+while [[ $# -gt 0 ]]; do [[ "$1" == "-u" ]] && { svc="$2"; shift; }; shift; done
+tail -n 30 "$R/var/log/$svc.log" 2>/dev/null || true

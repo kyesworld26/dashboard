@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fake npm: `npm ci` copies a prepared node_modules (no network in tests).
+[[ "${FAKE_NPM_FAIL:-0}" == 1 ]] && { echo "npm ERR! simulated failure" >&2; exit 1; }
+[[ "$1" == ci ]] || exit 0
+node -e "require('fs').cpSync(process.argv[1], 'node_modules', { recursive: true })" "${FAKE_NPM_MODULES:?}"

@@ -1,126 +1,50 @@
 #!/usr/bin/env bash
-# Pull the latest agent code from GitHub and restart the systemd service.
-# Idempotent and safe to re-run. Does NOT touch credentials in
-# /var/lib/dashboard-agent — your existing dashboard links survive the update.
+# Upgrade an existing dashboard-agent install. Credentials and links in
+# /var/lib/dashboard-agent and settings in /etc/dashboard-agent are kept.
 #
-# Two ways to run this:
+# This is a thin wrapper: it fetches the requested version and runs THAT
+# version's install-host.sh, which verifies every file (SHA256SUMS), stages the
+# new release, health-checks it and rolls back automatically on failure.
 #
-#   # A) One-liner over the internet (preferred):
+#   # Recommended: pin the exact commit from the release notes
+#   sudo AGENT_COMMIT=<40-character commit id> bash update-host.sh
+#
+#   # Latest main branch:
 #   curl -fsSL https://raw.githubusercontent.com/kyesworld26/dashboard/main/update-host.sh | sudo bash
 #
-#   # B) From a local clone:
-#   sudo bash update-host.sh
-#
-# Pin a specific commit/branch/tag for reproducible upgrades:
-#   curl -fsSL .../update-host.sh | sudo REPO_REF=v1.2.0 bash
+#   # Return to the previously installed version:
+#   sudo bash /opt/dashboard-agent/install-host.sh --rollback
 
-set -euo pipefail
+set -Eeuo pipefail
 
-REPO_URL=${REPO_URL:-https://github.com/kyesworld26/dashboard.git}
-REPO_REF=${REPO_REF:-main}
-INSTALL_DIR=/opt/dashboard-agent
-DATA_DIR=/var/lib/dashboard-agent
-SERVICE=dashboard-agent
-
-if [[ $EUID -ne 0 ]]; then
-  echo "error: must run as root (sudo)." >&2
-  exit 1
-fi
-
-# Refuse to "update" something that was never installed — point them at the
-# installer so they don't end up with half-configured state. We check for
-# concrete artifacts of a previous install rather than parsing systemctl
-# output (which varies between distros / systemd versions).
-UNIT_FILE=/etc/systemd/system/${SERVICE}.service
-if [[ ! -f "$UNIT_FILE" && ! -d "$INSTALL_DIR" ]]; then
-  echo "error: ${SERVICE} is not installed (no $UNIT_FILE, no $INSTALL_DIR)."
-  echo "       Run the installer first:"
-  echo "         curl -fsSL https://raw.githubusercontent.com/kyesworld26/dashboard/main/install-host.sh | sudo bash"
-  exit 1
-fi
-if [[ ! -f "$UNIT_FILE" ]]; then
-  echo "warning: $INSTALL_DIR exists but $UNIT_FILE is missing — will reinstall the unit."
-fi
-if [[ ! -d "$INSTALL_DIR" ]]; then
-  echo "warning: $UNIT_FILE exists but $INSTALL_DIR is missing — will recreate the install dir."
-  mkdir -p "$INSTALL_DIR"
-fi
-
-echo "==> Capturing currently-installed version..."
-PREV_REV=$(cat "$INSTALL_DIR/.installed-rev" 2>/dev/null || echo "(unknown)")
-echo "    Previously: $PREV_REV"
-
-echo "==> Fetching $REPO_URL ($REPO_REF) to a temp directory..."
-command -v git >/dev/null 2>&1 || {
-  if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y git
-  elif command -v dnf >/dev/null 2>&1; then dnf install -y git
-  else echo "install git first" >&2; exit 1; fi
-}
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$TMP"
-NEW_REV=$(git -C "$TMP" rev-parse --short HEAD)
-echo "    Fetched:    $NEW_REV"
-
-if [[ "$PREV_REV" == "$NEW_REV" ]]; then
-  echo "==> Already on $NEW_REV — nothing to update. Restarting service for good measure."
-  systemctl restart "$SERVICE"
-  exit 0
-fi
-
-echo "==> Backing up current install to ${INSTALL_DIR}.bak..."
-rm -rf "${INSTALL_DIR}.bak"
-cp -a "$INSTALL_DIR" "${INSTALL_DIR}.bak"
-
-echo "==> Copying new source files into $INSTALL_DIR..."
-for f in tunnel.js server.js link.js package.json; do
-  if [[ -f "$TMP/$f" ]]; then
-    cp "$TMP/$f" "$INSTALL_DIR/$f"
-  else
-    echo "warning: $f missing from upstream — leaving existing file in place." >&2
+main() {
+  local repo="${REPO_URL:-https://github.com/kyesworld26/dashboard.git}"
+  local ref="${AGENT_REF:-${REPO_REF:-main}}"
+  [[ $EUID -eq 0 ]] || { echo "error: must run as root (sudo)." >&2; exit 1; }
+  if [[ ! -f /etc/systemd/system/dashboard-agent.service && ! -d /opt/dashboard-agent ]]; then
+    echo "error: dashboard-agent is not installed. Run install-host.sh first." >&2
+    exit 1
   fi
-done
-[[ -f "$TMP/package-lock.json" ]] && cp "$TMP/package-lock.json" "$INSTALL_DIR/" || true
+  command -v git >/dev/null 2>&1 || { echo "error: git is required for updates." >&2; exit 1; }
 
-echo "==> Installing npm dependencies (if package.json changed)..."
-cd "$INSTALL_DIR"
-npm install --omit=dev --no-audit --no-fund
+  local tmp; tmp=$(mktemp -d /tmp/dashboard-agent-update.XXXXXXXX)
+  trap 'rm -rf "$tmp"' EXIT
+  if [[ -n "${AGENT_COMMIT:-}" ]]; then
+    [[ "$AGENT_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "error: AGENT_COMMIT must be a full 40-character commit id." >&2; exit 1; }
+    git init -q "$tmp"
+    git -C "$tmp" remote add origin "$repo"
+    git -C "$tmp" fetch -q --depth 1 origin "$AGENT_COMMIT"
+    git -C "$tmp" checkout -q FETCH_HEAD
+    [[ "$(git -C "$tmp" rev-parse HEAD)" == "$AGENT_COMMIT" ]] || { echo "error: fetched commit does not match AGENT_COMMIT." >&2; exit 1; }
+  else
+    [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "error: invalid AGENT_REF" >&2; exit 1; }
+    git clone -q --depth 1 --branch "$ref" "$repo" "$tmp"
+  fi
+  local prev new
+  prev=$(cat /opt/dashboard-agent/.installed-rev 2>/dev/null || echo unknown)
+  new=$(git -C "$tmp" rev-parse HEAD)
+  echo "==> Updating dashboard-agent: $prev -> $new"
+  AGENT_SOURCE_DIR="$tmp" bash "$tmp/install-host.sh"
+}
 
-echo "==> Refreshing 'dashboard-link' wrapper..."
-HUB_URL=$(systemctl show "$SERVICE" -p Environment --value | tr ' ' '\n' | sed -n 's/^HUB_URL=//p' | head -n1)
-HUB_URL=${HUB_URL:-wss://dashboard.kyesworld.com/agent}
-cat >/usr/local/bin/dashboard-link <<EOF
-#!/usr/bin/env bash
-# Auto-generated by update-host.sh — runs link.js with the same env the
-# systemd unit uses so tokens land where tunnel.js is watching.
-exec sudo HUB_URL="$HUB_URL" AGENT_DATA_DIR="$DATA_DIR" $(command -v node) $INSTALL_DIR/link.js "\$@"
-EOF
-chmod +x /usr/local/bin/dashboard-link
-
-echo "==> Restarting $SERVICE..."
-systemctl daemon-reload
-systemctl restart "$SERVICE"
-sleep 2
-
-if systemctl is-active --quiet "$SERVICE"; then
-  echo "$NEW_REV" > "$INSTALL_DIR/.installed-rev"
-  echo ""
-  echo "============================================================"
-  echo "Updated $PREV_REV -> $NEW_REV"
-  echo ""
-  systemctl --no-pager --lines=5 status "$SERVICE" || true
-  echo ""
-  echo "  Logs:    sudo journalctl -u $SERVICE -f"
-  echo "  Rollback: sudo rm -rf $INSTALL_DIR && sudo mv ${INSTALL_DIR}.bak $INSTALL_DIR && sudo systemctl restart $SERVICE"
-  echo "============================================================"
-else
-  echo "" >&2
-  echo "ERROR: $SERVICE failed to come back up after the update." >&2
-  echo "       Rolling back to ${INSTALL_DIR}.bak..." >&2
-  rm -rf "$INSTALL_DIR"
-  mv "${INSTALL_DIR}.bak" "$INSTALL_DIR"
-  systemctl restart "$SERVICE"
-  echo "       Rollback complete. Recent logs:" >&2
-  journalctl -u "$SERVICE" --no-pager -n 30 >&2
-  exit 1
-fi
+main "$@"

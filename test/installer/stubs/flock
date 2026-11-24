@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake flock (Git Bash has none): always grants the lock.
+exit 0

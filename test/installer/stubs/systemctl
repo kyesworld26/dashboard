@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Fake systemctl for installer tests: manages services as background node
+# processes inside $DASHBOARD_AGENT_TEST_ROOT. Never touches the real system.
+set -u
+R="${DASHBOARD_AGENT_TEST_ROOT:?not a test sandbox}"
+[[ -f "$R/.dashboard-agent-test-root" ]] || exit 99
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNITS="$R/etc/systemd/system"; RUN="$R/run"; LOGS="$R/var/log"; EN="$R/etc/systemd/enabled"
+mkdir -p "$RUN" "$LOGS" "$EN"
+
+pid_of() { cat "$RUN/$1.pid" 2>/dev/null; }
+alive() { local p; p=$(pid_of "$1"); [[ -n "$p" ]] && node -e "try{process.kill($p,0)}catch{process.exit(1)}"; }
+stop_svc() {
+  local p; p=$(pid_of "$1"); [[ -n "$p" ]] || return 0
+  node "$HERE/launch.js" kill "$p" || true
+  rm -f "$RUN/$1.pid"
+}
+start_svc() {
+  local unit="$UNITS/$1.service"
+  [[ -f "$unit" ]] || return 0   # e.g. "docker": pretend success
+  alive "$1" && return 0
+  local envfile execline
+  envfile=$(sed -n 's/^EnvironmentFile=//p' "$unit")
+  execline=$(sed -n 's/^ExecStart=//p' "$unit")
+  eval "local argv=($execline)"
+  (
+    set -a; [[ -n "$envfile" ]] && . "$envfile"; set +a
+    if command -v cygpath >/dev/null 2>&1; then
+      [[ -n "${AGENT_DATA_DIR:-}" ]] && export AGENT_DATA_DIR="$(cygpath -w "$AGENT_DATA_DIR")"
+      [[ -n "${SERVER_ROOT:-}" ]] && export SERVER_ROOT="$(cygpath -w "$SERVER_ROOT")"
+    fi
+    node "$HERE/launch.js" start "$RUN/$1.pid" "$LOGS/$1.log" "$R" "${argv[1]}"
+  )
+}
+
+cmd="${1:-}"; shift || true
+now=0; [[ "${1:-}" == "--now" ]] && { now=1; shift; }
+case "$cmd" in
+  daemon-reload) ;;
+  enable)  touch "$EN/${1:-x}"; [[ $now -eq 1 ]] && start_svc "$1" ;;
+  disable) rm -f "$EN/${1:-x}"; [[ $now -eq 1 ]] && stop_svc "$1" ;;
+  start)   start_svc "$1" ;;
+  stop)    stop_svc "$1" ;;
+  restart) stop_svc "$1"; start_svc "$1" ;;
+  is-active) [[ "${1:-}" == "--quiet" ]] && shift; alive "$1" ;;
+  show)    # show -p MainPID --value NAME
+    name="${!#}"; if alive "$name"; then pid_of "$name"; else echo 0; fi ;;
+  list-unit-files) for f in "$UNITS"/*.service; do [[ -f "$f" ]] && echo "$(basename "$f") enabled"; done ;;
+  status) alive "${1:-x}" && echo "active (running)" || echo "inactive" ;;
+  *) ;;
+esac
+exit 0
