@@ -282,7 +282,7 @@ test('transfer preflight checks the running Caddy and its mounted Caddyfile', as
   result = await check();
   assert.equal(result.status, 200, result.text);
   assert.deepEqual(result.json.blockers, []);
-  assert.ok(result.json.warnings.some(w => /Caddy will reload/.test(w)));
+  assert.ok(!result.json.warnings.some(w => /reload Caddy/i.test(w)));
 });
 
 test('hub URL policy: TLS required except loopback / private compose names', () => {

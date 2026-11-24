@@ -264,8 +264,8 @@ function register(app, ctx) {
 
   function publicJob(job) {
     if (!job) return null;
-    const { id, role, service, stage, status, error, warnings, bundle, stopped, wasRunning, verified, received, health, updatedAt } = job;
-    return { id, role, service, stage, status, error: error || null, warnings: warnings || [], bundle: bundle || null, stopped: stopped || [], wasRunning: !!wasRunning, verified: !!verified, received: received ?? null, health: health || null, updatedAt };
+    const { id, role, service, stage, status, error, warnings, bundle, stopped, wasRunning, verified, received, health, caddyReloaded, updatedAt } = job;
+    return { id, role, service, stage, status, error: error || null, warnings: warnings || [], bundle: bundle || null, stopped: stopped || [], wasRunning: !!wasRunning, verified: !!verified, received: received ?? null, health: health || null, caddyReloaded: !!caddyReloaded, updatedAt };
   }
 
   // Run a job step in the background; failures are recorded on the job.
@@ -591,7 +591,6 @@ function register(app, ctx) {
     }
     if (caddyNeedsReload) {
       try { await runningCaddy(); } catch (err) { blockers.push(err.message); }
-      warnings.push('Caddy will reload after the destination service is healthy. If you leave the service stopped, reload Caddy when you start it later.');
     }
 
     for (const b of Array.isArray(m.externalBinds) ? m.externalBinds : []) {
@@ -779,6 +778,16 @@ function register(app, ctx) {
 
   async function saveJournal(id, journal) { await writeJsonAtomic(journalFile(id), journal); }
 
+  async function reloadTransferredCaddy(job, journal) {
+    if (!(journal.caddyBlocks || []).length) return;
+    job.stage = 'reloading-caddy';
+    await saveJob(job);
+    journal.caddyReloadAttempted = true;
+    await saveJournal(job.id, journal);
+    await reloadCaddy();
+    job.caddyReloaded = true;
+  }
+
   function substitute(def, { serviceDirRel, envRel }) {
     const sub = s => typeof s !== 'string' ? s
       : s.replace(/\{\{SERVICE_DIR\}\}/g, serviceDirRel).replace(/\{\{ENV_FILE:([A-Za-z0-9._-]+)\}\}/g, (_, b) => envRel(b));
@@ -926,6 +935,7 @@ function register(app, ctx) {
     }
 
     await fs.rm(extract, { recursive: true, force: true });
+    if (job.startDestination === false) await reloadTransferredCaddy(job, journal);
     job.stage = 'installed';
   }
 
@@ -964,13 +974,7 @@ function register(app, ctx) {
       job.health = last;
       stable = ok ? stable + 1 : 0;
       if (stable >= HEALTH_STABLE_POLLS) {
-        if ((journal.caddyBlocks || []).length) {
-          job.stage = 'reloading-caddy';
-          await saveJob(job);
-          journal.caddyReloadAttempted = true;
-          await saveJournal(job.id, journal);
-          await reloadCaddy();
-        }
+        await reloadTransferredCaddy(job, journal);
         job.stage = 'started';
         return;
       }
@@ -1201,6 +1205,7 @@ function register(app, ctx) {
     if (!job.verified) fail(409, 'The bundle has not been verified.');
     if (!['received', 'extracting', 'verifying-files', 'checking', 'installing'].includes(job.stage)) fail(409, `Cannot install from stage ${job.stage}.`);
     if (await loadJournal(id)) fail(409, 'A previous install attempt left changes behind; roll back first.');
+    job.startDestination = req.body?.startDestination !== false;
     runInBackground(job, doInstall);
     res.json({ success: true, job: publicJob(job) });
   }));
