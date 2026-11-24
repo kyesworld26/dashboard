@@ -260,6 +260,31 @@ test('transfers can be disabled per direction on the server itself', async () =>
   assert.equal((await req('POST', '/api/transfer/inspect', { body: { service: '../etc' } })).status, 400);
 });
 
+test('transfer preflight checks the running Caddy and its mounted Caddyfile', async () => {
+  const summary = {
+    service: 'incoming-site', relatedServices: ['incoming-site'],
+    composeServices: { 'incoming-site': {} }, envFiles: [], volumes: [], externalNetworks: [],
+    caddyHosts: ['incoming.example.test:80'],
+  };
+  const check = () => req('POST', '/api/transfer/check-destination', { body: { summary } });
+  let result = await check();
+  assert.ok(result.json.blockers.some(b => /Caddy service/.test(b)));
+
+  const doc = compose();
+  doc.services.caddy = { image: 'caddy:latest', volumes: ['./other-Caddyfile:/etc/caddy/Caddyfile:ro'] };
+  fs.writeFileSync(path.join(root, 'server', 'docker-compose.yml'), YAML.stringify(doc));
+  writeState({ containers: [ctr('c'.repeat(64), 'proj-test-caddy-1', 'proj-test', 'caddy')], volumes: {}, networks: ['bridge'] });
+  result = await check();
+  assert.ok(result.json.blockers.some(b => /selected Caddyfile/.test(b)));
+
+  doc.services.caddy.volumes = ['./Caddyfile:/etc/caddy/Caddyfile:ro'];
+  fs.writeFileSync(path.join(root, 'server', 'docker-compose.yml'), YAML.stringify(doc));
+  result = await check();
+  assert.equal(result.status, 200, result.text);
+  assert.deepEqual(result.json.blockers, []);
+  assert.ok(result.json.warnings.some(w => /Caddy will reload/.test(w)));
+});
+
 test('hub URL policy: TLS required except loopback / private compose names', () => {
   assert.equal(checkHubUrl('wss://dashboard.example.com/agent'), null);
   assert.equal(checkHubUrl('ws://hub:3002/agent'), null);

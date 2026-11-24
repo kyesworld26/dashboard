@@ -210,7 +210,18 @@ switch (cmd) {
     out(`${rest[0]}\n`);
     break;
   }
-  case 'exec': out('ok\n'); break;
+  case 'exec': {
+    const s = load();
+    const c = s.containers.find(x => x.ID === rest[0] || x.Names === rest[0]);
+    if (!c || c.State !== 'running') die('fake exec: container is not running');
+    if (s.failCaddyReloadOnce && rest.includes('caddy') && rest.includes('reload')) {
+      delete s.failCaddyReloadOnce;
+      save(s);
+      die('fake Caddy reload failure');
+    }
+    out('ok\n');
+    break;
+  }
   case 'system': out('Total reclaimed space: 0B\n'); break;
   default: die(`fake docker: unsupported command ${cmd}`);
 }

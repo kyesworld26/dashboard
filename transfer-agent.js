@@ -310,6 +310,33 @@ function register(app, ctx) {
     return String(stdout).split('\n').map(s => s.trim()).filter(Boolean);
   }
 
+  async function runningCaddy() {
+    const doc = await ctx.readComposeDoc();
+    const volumes = doc.services?.caddy?.volumes;
+    if (!Array.isArray(volumes)) fail(409, 'The destination main Compose file has no Caddy service with a Caddyfile mount.');
+    const mount = volumes.map(v => {
+      if (typeof v === 'string') return /^(.+):\/etc\/caddy\/Caddyfile(?::[^:]*)?$/.exec(v)?.[1];
+      return v?.target === '/etc/caddy/Caddyfile' ? v.source : null;
+    }).find(Boolean);
+    if (!mount || !/^(?:\.|\/)/.test(mount)) fail(409, 'Caddy must mount the selected host Caddyfile at /etc/caddy/Caddyfile.');
+    const selected = await fs.realpath(ctx.CADDYFILE).catch(() => path.resolve(ctx.CADDYFILE));
+    const mounted = await fs.realpath(path.resolve(path.dirname(ctx.MAIN_COMPOSE), mount))
+      .catch(() => path.resolve(path.dirname(ctx.MAIN_COMPOSE), mount));
+    if (selected !== mounted) fail(409, 'The selected Caddyfile is not the one mounted by the destination Caddy service.');
+    const caddy = ctx.findContainerForService(await ctx.listDockerContainers(), 'caddy');
+    if (!caddy || ctx.getContainerStatus(caddy) !== 'running') fail(409, 'Caddy is not running in the destination main Compose project.');
+    return caddy.ID;
+  }
+
+  async function reloadCaddy() {
+    const id = await runningCaddy();
+    try {
+      await ctx.execCmd(`${D} exec ${q(id)} caddy reload --config /etc/caddy/Caddyfile`, 15_000);
+    } catch {
+      fail(502, 'Caddy rejected the updated configuration on the destination. Check the Caddyfile and Caddy logs.');
+    }
+  }
+
   // ─── Inspection (source) ───────────────────────────────────────────────────
   async function collectSource(service) {
     const doc = await ctx.readComposeDoc();
@@ -557,10 +584,15 @@ function register(app, ctx) {
     }
 
     const caddyContent = await ctx.readTextIfExists(ctx.CADDYFILE, '').catch(() => '');
+    let caddyNeedsReload = false;
     for (const h of Array.isArray(m.caddyHosts) ? m.caddyHosts : []) {
       if (h && caddyContent.includes(String(h))) warnings.push(`The destination Caddyfile already has a site for ${h}; that block will not be added.`);
+      else if (h) caddyNeedsReload = true;
     }
-    if (Array.isArray(m.caddyHosts) && m.caddyHosts.length) warnings.push('Caddy on the destination is not reloaded automatically; reload it after the transfer to route traffic to the new location.');
+    if (caddyNeedsReload) {
+      try { await runningCaddy(); } catch (err) { blockers.push(err.message); }
+      warnings.push('Caddy will reload after the destination service is healthy. If you leave the service stopped, reload Caddy when you start it later.');
+    }
 
     for (const b of Array.isArray(m.externalBinds) ? m.externalBinds : []) {
       warnings.push(`${b.service} mounts ${b.source}, which is outside the service folder and will NOT be transferred.`);
@@ -931,7 +963,17 @@ function register(app, ctx) {
       }
       job.health = last;
       stable = ok ? stable + 1 : 0;
-      if (stable >= HEALTH_STABLE_POLLS) { job.stage = 'started'; return; }
+      if (stable >= HEALTH_STABLE_POLLS) {
+        if ((journal.caddyBlocks || []).length) {
+          job.stage = 'reloading-caddy';
+          await saveJob(job);
+          journal.caddyReloadAttempted = true;
+          await saveJournal(job.id, journal);
+          await reloadCaddy();
+        }
+        job.stage = 'started';
+        return;
+      }
       await new Promise(r => setTimeout(r, HEALTH_POLL_MS));
     }
     fail(500, `The service did not become healthy on the destination (${Object.entries(last).map(([s, st]) => `${s}: ${st}`).join(', ')}).`);
@@ -949,6 +991,7 @@ function register(app, ctx) {
       if (toRemove.length) await attempt(`removed containers ${toRemove.join(', ')}`, () => ctx.execCmd(`${D} compose -f ${q(ctx.MAIN_COMPOSE)} rm -sf ${toRemove.map(q).join(' ')}`, 300_000));
       for (const v of journal.volumes || []) await attempt(`removed volume ${v}`, () => ctx.execCmd(`${D} volume rm ${q(v)}`, 60_000));
       if ((journal.caddyBlocks || []).length) {
+        let removed = false;
         await attempt('removed Caddy blocks', async () => {
           let content = await ctx.readTextIfExists(ctx.CADDYFILE, '');
           for (const b of journal.caddyBlocks) {
@@ -956,7 +999,9 @@ function register(app, ctx) {
             if (i >= 0) content = (content.slice(0, i).trimEnd() + '\n\n' + content.slice(i + b.length).trimStart()).trimEnd() + '\n';
           }
           await fs.writeFile(ctx.CADDYFILE, content, 'utf-8');
+          removed = true;
         });
+        if (removed && journal.caddyReloadAttempted) await attempt('reloaded Caddy after rollback', reloadCaddy);
       }
       for (const svc of added) await attempt(`removed compose service ${svc}`, () => ctx.removeMainComposeService(svc));
       for (const key of ['volumes', 'networks']) {
@@ -1166,7 +1211,7 @@ function register(app, ctx) {
     const job = requireJob(id, 'destination');
     if (job.status === 'running') return res.json({ success: true, job: publicJob(job) });
     if (job.stage === 'started') return res.json({ success: true, job: publicJob(job) });
-    if (!['installed', 'starting', 'health-check'].includes(job.stage)) fail(409, `Cannot start from stage ${job.stage}.`);
+    if (!['installed', 'starting', 'health-check', 'reloading-caddy'].includes(job.stage)) fail(409, `Cannot start from stage ${job.stage}.`);
     runInBackground(job, doStart);
     res.json({ success: true, job: publicJob(job) });
   }));
