@@ -39,7 +39,7 @@ new_sandbox() {
   echo "$r"
 }
 
-port=$((40000 + RANDOM % 20000))
+port=$(node -e 'const s = require("net").createServer(); s.listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); });')
 run_install() { # sandbox src [extra env...] -- [args]
   local r="$1" src="$2"; shift 2
   env DASHBOARD_AGENT_TEST_ROOT="$r" PATH="$STUBS:$PATH" HOME="$r/home" \
@@ -51,6 +51,35 @@ run_install() { # sandbox src [extra env...] -- [args]
 healthy() { local r="$1" pid; pid=$(DASHBOARD_AGENT_TEST_ROOT="$r" "$STUBS/systemctl" show -p MainPID --value dashboard-agent); [[ "$pid" != 0 ]] && grep -q "\"pid\":$pid," "$r/var/lib/dashboard-agent/status.json" 2>/dev/null && grep -q '"localApi":"up"' "$r/var/lib/dashboard-agent/status.json"; }
 rev() { cat "$1/opt/dashboard-agent/.installed-rev" 2>/dev/null; }
 tmpcount() { ls -d "${TMPDIR:-/tmp}"/dashboard-agent-install.* 2>/dev/null | wc -l; }
+update_tmpcount() { ls -d /tmp/dashboard-agent-update.* 2>/dev/null | wc -l; }
+
+# An existing Node 20 RPM must be upgraded after selecting the Node 22 repo.
+# Mock the package manager and Node binary; never touch the host packages.
+MOCK="$WORK/fedora-node"; mkdir -p "$MOCK"
+echo 20 > "$MOCK/node-version"
+cat > "$MOCK/node" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -p) cat "$MOCK_NODE_VERSION" ;;
+  --version) echo "v$(cat "$MOCK_NODE_VERSION").0.0" ;;
+  *) exit 1 ;;
+esac
+EOF
+cat > "$MOCK/dnf" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$MOCK_DNF_CALLS"
+[[ "${1:-}" == upgrade ]] && echo 22 > "$MOCK_NODE_VERSION"
+EOF
+chmod +x "$MOCK/node" "$MOCK/dnf"
+out=$( (
+  source <(sed '$d' "$AGENT/install-host.sh")
+  PKG=dnf; NODE_MAJOR_MIN=22; WORK="$MOCK"
+  export MOCK_NODE_VERSION="$MOCK/node-version" MOCK_DNF_CALLS="$MOCK/dnf-calls"
+  PATH="$MOCK:$PATH"
+  fetch_vendor_script() { printf '#!/bin/sh\nNODE_VERSION="22.x"\n' > "$2"; }
+  ensure_node
+) 2>&1); code=$?
+check '[[ $code -eq 0 && $(cat "$MOCK/node-version") == 22 ]] && grep -q "^upgrade -y -q nodejs$" "$MOCK/dnf-calls"' "Fedora upgrades an existing Node 20 package" "$out"
 
 echo "# installer tests in $WORK"
 SRC="$(make_src src)"
@@ -110,6 +139,12 @@ check 'grep -q keep-me "$SB/var/lib/dashboard-agent/agent.json"' "credentials un
 REPO="$WORK/repo"; cp -r "$SRC" "$REPO"
 (cd "$REPO" && git init -q && git -c user.email=t@example.test -c user.name=test add -A && git -c user.email=t@example.test -c user.name=test commit -qm release)
 SHA=$(git -C "$REPO" rev-parse HEAD)
+SB_UPDATE="$(new_sandbox updater)"; mkdir -p "$SB_UPDATE/opt/dashboard-agent"
+echo old > "$SB_UPDATE/opt/dashboard-agent/.installed-rev"
+before=$(update_tmpcount)
+out=$(env DASHBOARD_AGENT_TEST_ROOT="$SB_UPDATE" PATH="$STUBS:$PATH" AGENT_COMMIT=invalid bash "$SRC/update-host.sh" 2>&1); code=$?
+check '[[ $code -ne 0 ]] && grep -q "full 40-character" <<<"$out" && ! grep -q "unbound variable" <<<"$out"' "updater reports its original error without a cleanup error" "$out"
+check '[[ $(update_tmpcount) -eq $before ]]' "updater removes temporary files after failure" "$out"
 LONE="$WORK/lone"; mkdir -p "$LONE"; cp "$REPO/install-host.sh" "$LONE/"
 out=$(env DASHBOARD_AGENT_TEST_ROOT="$SB" PATH="$STUBS:$PATH" HOME="$SB/home" HUB_URL=ws://127.0.0.1:9/agent AGENT_HEALTH_TIMEOUT_SEC=25 \
       AGENT_LOCAL_PORT="$port" AGENT_DOCKER_BIN="\"$NODE_BIN\" \"$FAKE_DOCKER\"" FAKE_DOCKER_STATE="$(winpath "$SB/docker")" \

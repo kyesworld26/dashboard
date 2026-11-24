@@ -296,7 +296,13 @@ ensure_node() {
     dnf|yum)
       fetch_vendor_script "https://rpm.nodesource.com/setup_${NODE_MAJOR_MIN}.x" "$WORK/nodesource.sh" "NODE_VERSION=\"${NODE_MAJOR_MIN}.x\""
       bash "$WORK/nodesource.sh" >/dev/null
-      "$PKG" install -y -q nodejs ;;
+      # `install` considers an existing Node 20 package satisfied even after
+      # the NodeSource 22 repository has been configured. Upgrade it explicitly.
+      if command -v node >/dev/null 2>&1; then
+        "$PKG" upgrade -y -q nodejs
+      else
+        "$PKG" install -y -q nodejs
+      fi ;;
     pacman)
       pacman -Sy --needed --noconfirm nodejs npm ;;
     *)
