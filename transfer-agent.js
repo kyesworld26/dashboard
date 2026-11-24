@@ -984,24 +984,42 @@ function register(app, ctx) {
   }
 
   // Undo exactly what the journal says this transfer created. Idempotent.
-  async function removeTransferredContainers(service, services) {
-    const lock = locks.get(service);
+  // Containers of `services` that belong to THIS server's main compose project
+  // (by config-file label, or by project label when the file path recorded by
+  // compose differs, e.g. via a symlink). Works even after the compose entry
+  // was removed, unlike `docker compose rm`.
+  async function containersOfMainProject(services) {
+    await ctx.readComposeDoc().catch(() => {}); // make sure the project name is known
+    const project = ctx.composeProject;
+    const found = [];
     for (const svc of services) {
       const { stdout } = await ctx.execCmd(`${D} ps -aq --filter ${q(`label=com.docker.compose.service=${svc}`)}`);
       for (const id of stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
         const inspected = JSON.parse((await ctx.execCmd(`${D} inspect ${q(id)}`)).stdout)[0];
         const labels = inspected?.Config?.Labels || {};
-        const files = String(labels['com.docker.compose.project.config_files'] || '').split(',');
-        if (!files.includes(ctx.MAIN_COMPOSE)) continue;
-        // Older journals only recorded service names. The destination lock and
-        // Compose labels establish that this container belongs to this attempt.
-        if (!lock || !Date.parse(lock.at) || !Date.parse(inspected.Created)
-            || Date.parse(inspected.Created) < Date.parse(lock.at) - 60_000) {
-          fail(409, `Cannot verify that container ${id} belongs to this transfer.`);
-        }
-        await ctx.execCmd(`${D} rm -f ${q(id)}`, 300_000);
+        const files = String(labels['com.docker.compose.project.config_files'] || '').split(',').map(s => s.trim());
+        const sameProject = project && String(labels['com.docker.compose.project'] || '').toLowerCase() === project;
+        if (files.includes(ctx.MAIN_COMPOSE) || sameProject) found.push({ id, svc, inspected });
       }
     }
+    return found;
+  }
+
+  async function removeTransferredContainers(service, services) {
+    const lock = locks.get(service);
+    for (const { id, inspected } of await containersOfMainProject(services)) {
+      // Older journals only recorded service names. The destination lock and
+      // Compose labels establish that this container belongs to this attempt.
+      if (!lock || !Date.parse(lock.at) || !Date.parse(inspected.Created)
+          || Date.parse(inspected.Created) < Date.parse(lock.at) - 60_000) {
+        fail(409, `Cannot verify that container ${id.slice(0, 12)} belongs to this transfer.`);
+      }
+      await ctx.execCmd(`${D} rm -f ${q(id)}`, 300_000);
+    }
+    // Never report success while a transferred container is still present: it
+    // could keep running next to the original that was restarted on the source.
+    const left = await containersOfMainProject(services);
+    if (left.length) fail(500, `Container ${left[0].id.slice(0, 12)} for "${left[0].svc}" is still present on this server.`);
   }
 
   async function rollbackDestination(id, service) {

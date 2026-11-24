@@ -211,6 +211,7 @@ switch (cmd) {
     if (rest.includes('--format')) out(JSON.stringify(c.mounts) + '\n');
     else out(JSON.stringify([{ Created: c.CreatedAt, Config: { Labels: {
       'com.docker.compose.project.config_files': c.composeConfigFile,
+      'com.docker.compose.project': c.project,
       'com.docker.compose.service': c.service,
     } } }]) + '\n');
     break;

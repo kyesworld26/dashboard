@@ -336,3 +336,26 @@ test('hub URL policy: TLS required except loopback / private compose names', () 
   assert.match(checkHubUrl('https://dashboard.example.com/agent'), /wss/);
   assert.match(checkHubUrl('not a url'), /valid URL/);
 });
+
+test('rollback also removes a transferred container whose compose path label differs, and never reports success while one remains', async () => {
+  const id = crypto.randomUUID();
+  const name = 'retry-symlink';
+  const init = await req('POST', `/api/transfer/${id}/receive/init`, { body: { service: name, size: 10, sha256: 'c'.repeat(64) } });
+  assert.equal(init.status, 200, init.text);
+  const dir = path.join(root, 'data', 'transfers', id);
+  fs.writeFileSync(path.join(dir, 'journal.json'), JSON.stringify({
+    serviceDir: null, envFiles: [], composeServices: [name], topVolumes: [], topNetworks: [], caddyBlocks: [], containers: [name], volumes: [],
+  }));
+  // Same compose project, but compose recorded the file via another path (e.g. a symlink).
+  const viaSymlink = { ...ctr('d'.repeat(64), 'proj-test-retry-symlink-1', 'proj-test', name),
+    CreatedAt: new Date().toISOString(), composeConfigFile: path.join(root, 'link-to-server', 'docker-compose.yml') };
+  writeState({ containers: [viaSymlink], volumes: {}, networks: ['bridge'], failDockerRm: [name] });
+  const failed = await req('POST', `/api/transfer/${id}/rollback`, { body: { service: name } });
+  assert.equal(failed.json.ok, false, 'a container that could not be removed is reported, not ignored');
+  const state = JSON.parse(fs.readFileSync(path.join(root, 'docker', 'state.json'), 'utf-8'));
+  delete state.failDockerRm;
+  writeState(state);
+  const ok = await req('POST', `/api/transfer/${id}/rollback`, { body: { service: name } });
+  assert.equal(ok.json.ok, true, ok.text);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'docker', 'state.json'), 'utf-8')).containers, []);
+});
